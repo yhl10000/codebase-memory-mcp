@@ -1481,7 +1481,15 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
         }
         return NULL;
     }
+    cbm_text_view_status_t text_status = cbm_pipeline_normalize_source(fi->language, &src, &slen);
+    if (text_status == CBM_TEXT_VIEW_OOM) {
+        atomic_store(&ctx->source_oom, true);
+        cbm_log_error("pipeline.source_oom", "phase", "calls_fallback", "path", fi->rel_path);
+        free(src);
+        return NULL;
+    }
     CBMFileResult *r =
+        text_status != CBM_TEXT_VIEW_OK ? cbm_pipeline_text_error_result(fi->language, text_status) :
         cbm_pipeline_test_force_extract_null(ctx, fi->language)
             ? NULL
             : cbm_extract_file_ex_with_tests(
@@ -1522,6 +1530,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         bool result_owned = false;
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
+            if (atomic_load(&ctx->source_oom)) return CBM_PIPELINE_ABORT_PRESERVE_DB;
             if (atomic_load(&ctx->test_declarations_failed)) {
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }

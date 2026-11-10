@@ -91,6 +91,28 @@ static void dl_fix_free(dl_fix_t *fx) {
     th_rmtree(fx->tmpdir);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+TEST(doclinks_utf16_allocation_failure_aborts) {
+    dl_fix_t fx;
+    ASSERT_TRUE(dl_fix_init(&fx));
+    const unsigned char document[] = {0xff, 0xfe, '#', 0, ' ', 0, 'A', 0, '\n', 0};
+    FILE *fp = cbm_fopen(TH_PATH(fx.tmpdir, "README.md"), "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(fwrite(document, 1, sizeof(document), fp), sizeof(document));
+    ASSERT_EQ(fclose(fp), 0);
+    add_file_node(fx.gb, fx.project, "README.md");
+    cbm_text_view_fail_next_alloc_for_tests();
+    int rc = run_doclinks(fx.gb, fx.project, fx.tmpdir);
+    cbm_text_view_t view = {0};
+    cbm_text_view_status_t next = cbm_text_view_init((const char *)document, sizeof(document), &view);
+    cbm_text_view_release(&view);
+    dl_fix_free(&fx);
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(next, CBM_TEXT_VIEW_OK);
+    PASS();
+}
+#endif
+
 /* ── Markdown: inline link ───────────────────────────────────────── */
 
 TEST(doclinks_md_inline_link) {
@@ -528,6 +550,9 @@ TEST(doclinks_fenced_code_block_bare_mention_pinned) {
 /* ── Suite ───────────────────────────────────────────────────────── */
 
 SUITE(doclinks) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(doclinks_utf16_allocation_failure_aborts);
+#endif
     /* Markdown strategies */
     RUN_TEST(doclinks_md_inline_link);
     RUN_TEST(doclinks_md_backtick_path);

@@ -17,6 +17,7 @@
 #include "discover/test_conventions.h"
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
+#include "foundation/str_util.h"
 #include "spawn_patterns.h"
 #include "service_patterns.h" /* cbm_svc_kind_t */
 #include "cbm.h"
@@ -24,8 +25,45 @@
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
+#include <limits.h>
+#include <stdlib.h>
 
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
+
+static inline cbm_text_view_status_t cbm_pipeline_normalize_source(CBMLanguage language,
+                                                                   char **source, int *length) {
+    if (language != CBM_LANG_MARKDOWN && language != CBM_LANG_RST &&
+        language != CBM_LANG_ASCIIDOC) return CBM_TEXT_VIEW_OK;
+    cbm_text_view_t view = {0};
+    cbm_text_view_status_t status = *length < 0 ? CBM_TEXT_VIEW_INVALID
+        : cbm_text_view_init(*source, (size_t)*length, &view);
+    if (status == CBM_TEXT_VIEW_OK && view.length > INT_MAX) status = CBM_TEXT_VIEW_INVALID;
+    if (status == CBM_TEXT_VIEW_OK) {
+        if (view.owned) {
+            free(*source);
+            *source = view.owned;
+            view.owned = NULL;
+        }
+        *length = (int)view.length;
+    }
+    cbm_text_view_release(&view);
+    return status;
+}
+
+static inline CBMFileResult *cbm_pipeline_text_error_result(CBMLanguage language,
+                                                           cbm_text_view_status_t status) {
+    if (status == CBM_TEXT_VIEW_OOM) return NULL;
+    CBMFileResult *r = cbm_result_alloc();
+    if (!r) return NULL;
+    cbm_arena_init_lazy(&r->arena, CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    r->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
+    r->py_namespace.language = language;
+    r->py_namespace.status = CBM_PY_NS_NOT_APPLICABLE;
+    r->has_error = true;
+    r->error_msg = "invalid text encoding";
+    r->doc_links.failed = true;
+    return r;
+}
 
 typedef enum {
     CBM_PIPELINE_FROZEN_OK = 0,
@@ -441,6 +479,8 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+    /* Decoder OOM invalidates the run; malformed text remains a per-file diagnostic. */
+    _Atomic bool source_oom;
 
     /* Run-owned immutable snapshot; direct borrow also works for probe contexts
      * whose pipeline back-pointer is NULL. Workers only write the fatal latch. */

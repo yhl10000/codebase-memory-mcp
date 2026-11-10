@@ -1,5 +1,5 @@
 /*
- * str_util.c — Safe string operations (arena-allocated).
+ * str_util.c — Safe string operations and decoded text views.
  */
 #include "str_util.h"
 #include "arena.h" // CBMArena, cbm_arena_alloc/strdup/strndup
@@ -7,6 +7,107 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <limits.h>
+#ifdef CBM_ENABLE_TEST_SEAMS
+#include <stdatomic.h>
+static _Atomic bool text_fail_next_alloc;
+void cbm_text_view_fail_next_alloc_for_tests(void) {
+    atomic_store(&text_fail_next_alloc, true);
+}
+#endif
+
+static uint32_t text_utf16_unit(const unsigned char *p, bool be) {
+    return be ? ((uint32_t)p[0] << 8) | p[1] : ((uint32_t)p[1] << 8) | p[0];
+}
+
+cbm_text_view_status_t cbm_text_view_init(const char *raw, size_t length, cbm_text_view_t *out) {
+    if (!out) {
+        return CBM_TEXT_VIEW_INVALID;
+    }
+    *out = (cbm_text_view_t){0};
+    if ((!raw && length) || length > INT_MAX) {
+        return CBM_TEXT_VIEW_INVALID;
+    }
+    const unsigned char *bytes = (const unsigned char *)raw;
+    bool le = length >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe;
+    bool be = length >= 2 && bytes[0] == 0xfe && bytes[1] == 0xff;
+    if (!le && !be) {
+        if (length && memchr(raw, 0, length)) {
+            return CBM_TEXT_VIEW_INVALID;
+        }
+        out->data = raw;
+        out->length = length;
+        return CBM_TEXT_VIEW_OK;
+    }
+    if (length % 2) {
+        return CBM_TEXT_VIEW_INVALID;
+    }
+    size_t n = 0;
+    /* Validate and size before allocating; malformed input never produces a partial view. */
+    for (int pass = 0; pass < 2; pass++) {
+        size_t pos = 0;
+        for (size_t i = 2; i < length; i += 2) {
+            uint32_t cp = text_utf16_unit(bytes + i, be);
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+                if (length - i < 4) {
+                    cbm_text_view_release(out);
+                    return CBM_TEXT_VIEW_INVALID;
+                }
+                uint32_t low = text_utf16_unit(bytes + i + 2, be);
+                if (low < 0xdc00 || low > 0xdfff) {
+                    cbm_text_view_release(out);
+                    return CBM_TEXT_VIEW_INVALID;
+                }
+                cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+                i += 2;
+            } else if (!cp || (cp >= 0xdc00 && cp <= 0xdfff)) {
+                cbm_text_view_release(out);
+                return CBM_TEXT_VIEW_INVALID;
+            }
+            size_t width = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (pos > (size_t)INT_MAX - width) {
+                cbm_text_view_release(out);
+                return CBM_TEXT_VIEW_INVALID;
+            }
+            if (pass) {
+                if (width == 1) {
+                    out->owned[pos] = (char)cp;
+                } else {
+                    static const unsigned char lead[] = {0, 0, 0xc0, 0xe0, 0xf0};
+                    out->owned[pos] = (char)(lead[width] | (cp >> (6 * (width - 1))));
+                    for (size_t j = 1; j < width; j++) {
+                        out->owned[pos + j] = (char)(0x80 | ((cp >> (6 * (width - 1 - j))) & 0x3f));
+                    }
+                }
+            }
+            pos += width;
+        }
+        if (!pass) {
+            n = pos;
+#ifdef CBM_ENABLE_TEST_SEAMS
+            if (atomic_exchange(&text_fail_next_alloc, false)) return CBM_TEXT_VIEW_OOM;
+#endif
+            out->owned = malloc(n + 1);
+            if (!out->owned) {
+                return CBM_TEXT_VIEW_OOM;
+            }
+        }
+    }
+    out->owned[n] = 0;
+    out->data = out->owned;
+    out->length = n;
+    out->encoding = be ? CBM_TEXT_UTF16_BE : CBM_TEXT_UTF16_LE;
+    return CBM_TEXT_VIEW_OK;
+}
+
+void cbm_text_view_release(cbm_text_view_t *view) {
+    if (view) {
+        free(view->owned);
+        *view = (cbm_text_view_t){0};
+    }
+}
 
 enum {
     JSON_ESC_LEN = 2,       /* escaped char takes 2 bytes (backslash + char) */

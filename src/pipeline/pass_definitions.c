@@ -1032,7 +1032,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
             errors++;
             if (!cbm_pipeline_test_extraction_ok(ctx, lang, NULL)) {
-                goto configured_failure;
+                goto extraction_failure;
             }
             continue;
         }
@@ -1062,15 +1062,24 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             /* Proven empty files contain no invocation; other missing source
              * cannot certify an active configured-definition mapping. */
             if (rst != CBM_READ_EMPTY && !cbm_pipeline_test_extraction_ok(ctx, lang, NULL)) {
-                goto configured_failure;
+                goto extraction_failure;
             }
             continue;
+        }
+
+        cbm_text_view_status_t text_status = cbm_pipeline_normalize_source(lang, &source, &source_len);
+        if (text_status == CBM_TEXT_VIEW_OOM) {
+            atomic_store(&ctx->source_oom, true);
+            cbm_log_error("pipeline.source_oom", "phase", "definitions", "path", rel);
+            free(source);
+            goto extraction_failure;
         }
 
         /* Studio Export XML is transformed to one cacheable aggregate so later
          * passes see the same calls/usages/semantic carriers as native UDL. */
         CBMFileResult *result =
-            cbm_pipeline_test_force_extract_null(ctx, lang) ? NULL
+            text_status != CBM_TEXT_VIEW_OK ? cbm_pipeline_text_error_result(lang, text_status)
+            : cbm_pipeline_test_force_extract_null(ctx, lang) ? NULL
             : lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
@@ -1082,7 +1091,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         if (!cbm_pipeline_test_extraction_ok(ctx, lang, result)) {
             cbm_free_result(result);
-            goto configured_failure;
+            goto extraction_failure;
         }
         if (!result) {
             errors++;
@@ -1094,7 +1103,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
         if (!cbm_pipeline_test_result_ok(ctx, result)) {
             cbm_free_result(result);
-            goto configured_failure;
+            goto extraction_failure;
         }
         /* Consume the previously-ignored has_error flag: a parse timeout /
          * parse failure / unsupported-grammar result carries no defs but must
@@ -1219,7 +1228,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                  itoa_log(errors));
     return 0;
 
-configured_failure:
+extraction_failure:
     if (owns_local_cache) {
         for (int j = 0; j < file_count; j++) {
             cbm_free_result(local_cache[j]);

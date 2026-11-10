@@ -775,7 +775,8 @@ bool cbm_doclink_md_classify_span(const char *text, size_t len, char *buf, size_
     while (len > 0 && md_blank((unsigned char)text[len - SKIP_ONE])) {
         len--;
     }
-    if (len == 0 || len > MD_SPAN_MAX || len + SKIP_ONE > cap || md_has(text, len, '\n')) {
+    if (len == 0 || len > MD_SPAN_MAX || len + SKIP_ONE > cap || md_has(text, len, '\n') ||
+        memchr(text, '\0', len)) {
         return false;
     }
     memcpy(buf, text, len);

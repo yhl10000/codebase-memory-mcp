@@ -94,6 +94,64 @@ static bool md_ends_with(const char *s, const char *suffix) {
     return a >= b && strcmp(s + a - b, suffix) == 0;
 }
 
+TEST(md_span_embedded_nul_is_rejected) {
+    const char bytes[] = {0, 'C', 0, ':', 0, '\\', 0, 'r', 0};
+    char scratch[151];
+    CBMDocLinkMdPath path;
+    ASSERT_FALSE(cbm_doclink_md_classify_span(bytes, sizeof(bytes), scratch, sizeof(scratch), &path));
+    ASSERT_EQ(path.shape, CBM_DOCLINK_MD_NONE);
+    PASS();
+}
+
+TEST(doc_links_md_utf16_matches_utf8) {
+    const char utf8[] = "# Guide\r\n\r\nSee `C:\\repo\\main.py` and `app/run.py`.\r\n";
+    CBMFileResult *control = dm_extract(utf8, CBM_LANG_MARKDOWN, "docs/encoding.md");
+    ASSERT_NOT_NULL(control);
+    ASSERT_FALSE(control->has_error);
+    ASSERT_GT(control->doc_links.count, 0);
+    char bom[sizeof(utf8) + 3];
+    memcpy(bom, "\xef\xbb\xbf", 3);
+    memcpy(bom + 3, utf8, sizeof(utf8));
+    CBMFileResult *with_bom = dm_extract(bom, CBM_LANG_MARKDOWN, "docs/encoding.md");
+    ASSERT_NOT_NULL(with_bom);
+    ASSERT_FALSE(with_bom->has_error);
+    ASSERT_EQ(with_bom->defs.count, control->defs.count);
+    ASSERT_EQ(with_bom->doc_links.count, control->doc_links.count);
+    cbm_free_result(with_bom);
+    for (int be = 0; be < 2; be++) {
+        char raw[2 * sizeof(utf8)];
+        raw[0] = be ? (char)0xfe : (char)0xff;
+        raw[1] = be ? (char)0xff : (char)0xfe;
+        for (size_t i = 0; i < sizeof(utf8) - 1; i++) {
+            raw[2 + 2 * i + be] = utf8[i];
+            raw[2 + 2 * i + !be] = 0;
+        }
+        CBMFileResult *r = cbm_extract_file(raw, (int)sizeof(raw), CBM_LANG_MARKDOWN,
+                                            "p", "docs/encoding.md", 0, NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_FALSE(r->doc_links.failed);
+        ASSERT_EQ(r->defs.count, control->defs.count);
+        ASSERT_EQ(r->doc_links.count, control->doc_links.count);
+        for (int i = 0; i < r->defs.count; i++) {
+            ASSERT_STR_EQ(r->defs.items[i].name, control->defs.items[i].name);
+            ASSERT_EQ(r->defs.items[i].start_line, control->defs.items[i].start_line);
+            ASSERT_EQ(r->defs.items[i].end_line, control->defs.items[i].end_line);
+        }
+        for (int i = 0; i < r->doc_links.count; i++) {
+            ASSERT_STR_EQ(r->doc_links.items[i].raw, control->doc_links.items[i].raw);
+            ASSERT_EQ(r->doc_links.items[i].line, control->doc_links.items[i].line);
+            ASSERT_EQ(r->doc_links.items[i].def_line, control->doc_links.items[i].def_line);
+            ASSERT_STR_EQ(r->doc_links.items[i].source_qn, control->doc_links.items[i].source_qn);
+            ASSERT_EQ(r->doc_links.items[i].syntax, control->doc_links.items[i].syntax);
+            ASSERT_EQ(r->doc_links.items[i].flags, control->doc_links.items[i].flags);
+        }
+        cbm_free_result(r);
+    }
+    cbm_free_result(control);
+    PASS();
+}
+
 TEST(doc_links_md_extract_tokens) {
     CBMFileResult *r = dm_extract(MD_GUIDE, CBM_LANG_MARKDOWN, "docs/guide.md");
     ASSERT_NOT_NULL(r);
@@ -1569,6 +1627,8 @@ TEST(doc_links_md_name_scope_rules) {
 
 SUITE(doc_links_md) {
     dm_ship_held_families();
+    RUN_TEST(md_span_embedded_nul_is_rejected);
+    RUN_TEST(doc_links_md_utf16_matches_utf8);
     RUN_TEST(doc_links_md_extract_tokens);
     RUN_TEST(doc_links_md_repeated_headings);
     RUN_TEST(doc_links_md_repeated_bare_name_priority);
