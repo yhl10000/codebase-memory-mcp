@@ -53,15 +53,14 @@
  * stille Reparatur: gezaehlt wird, was wegfaellt.
  */
 
-/**
- * Wie weit der Index eine Datei erfasst hat.
- *
- * Die fuenf Werte sind genau die Klassen, die der Server meldet, und keine
- * mehr: `indexed` ist die Abwesenheit eines Befundes, die anderen vier kommen
- * aus dem `kind` einer Coverage-Zeile. Ein sechster Wert waere ein Status, den
- * niemand gemeldet hat.
- */
+/** Existing display states; partial includes parser and call-resolution gaps. */
 export type CoverageState = 'indexed' | 'partial' | 'skipped' | 'not-indexed' | 'ignored';
+
+export interface CoverageDiagnostics {
+    parsePartial?: boolean;
+    parseUnusable?: boolean;
+    unresolvedCalls?: boolean;
+}
 
 /**
  * Die Stufen von "ganz da" nach "am unerklaertesten weg".
@@ -93,17 +92,9 @@ export function worstCoverage(left: CoverageState, right: CoverageState): Covera
     return coverageRank(right) > coverageRank(left) ? right : left;
 }
 
-/**
- * Das `kind` einer Coverage-Zeile als Stufe.
- *
- * Der Server schreibt `parse_partial`, `not_indexed_dir`, `not_indexed_file`
- * und ansonsten den Namen der Phase, in der er aufgegeben hat (mcp.c,
- * add_coverage_report: alles, was keiner der drei Namen ist, landet unter
- * `skipped`). Genau diese Zuordnung steht hier, damit die Oberflaeche keine
- * eigene erfindet.
- */
+/** Graph diagnostics describe incomplete evidence, not skipped source. */
 export function coverageStateForKind(kind: string): CoverageState {
-    if (kind === 'parse_partial') {
+    if (kind === 'parse_partial' || kind === 'parse_unusable' || kind === 'unresolved_calls') {
         return 'partial';
     }
     if (kind.startsWith('not_indexed')) {
@@ -136,6 +127,7 @@ export interface TreeChild {
     coverage?: CoverageState;
     /** Der Grund des Servers, soweit er einen genannt hat. */
     coverageReason?: string;
+    coverageDiagnostics?: CoverageDiagnostics;
     /** Die Quellen, die diesen Pfad genannt haben. Fuer die ehrliche Herkunft. */
     coverageSources?: string[];
 }
@@ -687,8 +679,9 @@ export interface CoverageRecord {
     path: string;
     kind: 'file' | 'dir';
     state: CoverageState;
-    /** Der Grund des Servers. Leer heisst: er hat keinen genannt. */
+    /** Parser ranges or a skip reason, never raw call-resolution evidence. */
     reason: string;
+    diagnostics?: CoverageDiagnostics;
     /** Welche Quellen diesen Pfad genannt haben, in der Reihenfolge des Eintreffens. */
     sources: string[];
 }
@@ -719,7 +712,7 @@ export const EMPTY_COVERAGE: CoverageIndex = {
 
 function putRecord(
     records: Map<string, CoverageRecord>,
-    entry: { path: string; kind: 'file' | 'dir'; state: CoverageState; reason: string; source: string },
+    entry: { path: string; kind: 'file' | 'dir'; state: CoverageState; reason: string; source: string; diagnostics?: CoverageDiagnostics },
 ): void {
     const path = normalizeCoveragePath(entry.path);
     if (path.length === 0) {
@@ -732,6 +725,7 @@ function putRecord(
             kind: entry.kind,
             state: entry.state,
             reason: entry.reason,
+            ...(entry.diagnostics ? { diagnostics: { ...entry.diagnostics } } : {}),
             sources: [entry.source],
         });
         return;
@@ -739,6 +733,7 @@ function putRecord(
     if (!existing.sources.includes(entry.source)) {
         existing.sources.push(entry.source);
     }
+    if (entry.diagnostics) existing.diagnostics = { ...existing.diagnostics, ...entry.diagnostics };
     // Ein Ordner bleibt ein Ordner: die Scope-Liste nennt Pfade ohne Art, und
     // eine Datei daraus duerfte einen bekannten Ordner nicht ueberschreiben.
     if (entry.kind === 'dir') {
@@ -748,7 +743,7 @@ function putRecord(
     if (worst !== existing.state) {
         existing.state = worst;
         existing.reason = entry.reason;
-    } else if (existing.reason.length === 0) {
+    } else if (entry.state === worst && existing.reason.length === 0) {
         existing.reason = entry.reason;
     }
 }
@@ -793,6 +788,7 @@ export function buildCoverageIndex(input: {
                 kind: 'file',
                 state: 'partial',
                 reason: entry.errorRanges,
+                diagnostics: { parsePartial: true },
                 source: 'index_status.parse_partial',
             });
         }
@@ -854,7 +850,10 @@ export function buildCoverageIndex(input: {
                 path: row.path,
                 kind: row.kind === 'not_indexed_dir' ? 'dir' : 'file',
                 state,
-                reason: row.detail,
+                reason: row.kind === 'unresolved_calls' || row.kind === 'parse_unusable' ? '' : row.detail,
+                ...(row.kind === 'parse_partial' ? { diagnostics: { parsePartial: true } }
+                    : row.kind === 'parse_unusable' ? { diagnostics: { parseUnusable: true } }
+                    : row.kind === 'unresolved_calls' ? { diagnostics: { unresolvedCalls: true } } : {}),
                 source: `check_index_coverage.scope:${scope.scope.length > 0 ? scope.scope : '.'}`,
             });
             counts.scopeEntries += 1;
@@ -958,6 +957,7 @@ export function mergeCoverageIntoLevels(
             }
             if (record !== undefined) {
                 child.coverageSources = [...record.sources];
+                if (record.diagnostics) child.coverageDiagnostics = { ...record.diagnostics };
             }
         }
         level.children.sort(compareChildren);

@@ -305,6 +305,14 @@ describe('normalizeCoveragePath', () => {
 
 describe('coverageStateForKind', () => {
 
+    it.each(['unresolved_calls', 'parse_unusable'])('keeps %s graph diagnostics readable', (kind) => {
+        expect(coverageStateForKind(kind)).toBe('partial');
+    });
+
+    it.each(['extract', 'oversized'])('keeps the real %s skip phase skipped', (kind) => {
+        expect(coverageStateForKind(kind)).toBe('skipped');
+    });
+
     it('kennt genau die Namen, die der Server schreibt', () => {
         expect(coverageStateForKind('parse_partial')).toBe('partial');
         expect(coverageStateForKind('not_indexed_file')).toBe('not-indexed');
@@ -312,7 +320,7 @@ describe('coverageStateForKind', () => {
         expect(coverageStateForKind('ignored_file')).toBe('ignored');
     });
 
-    it('nimmt jede andere Phase als uebersprungen, so wie der Server es tut', () => {
+    it('keeps other skip phases skipped', () => {
         expect(coverageStateForKind('discovery')).toBe('skipped');
         expect(coverageStateForKind('parse_failed')).toBe('skipped');
     });
@@ -401,6 +409,42 @@ describe('readCoverageAnswer', () => {
 });
 
 describe('buildCoverageIndex', () => {
+
+    it.each([true, false])('keeps partial source readable with unresolved calls and a status entry: %s', (inStatus) => {
+        const path = 'ContourUI/fsurfacemanager.cpp';
+        const status = readIndexStatusCoverage({
+            parse_partial: { files: inStatus ? [{ path, error_ranges: '66-66,99-99' }] : [], count: 1, truncated: !inStatus },
+            skipped: { files: [], count: 0, truncated: false },
+        });
+        const answer = readCoverageAnswer({ scopes: [{
+            requested_scope: '.', scope: '.', status: 'known_gaps', total: 2, has_more: false,
+            entries: [
+                { path, kind: 'parse_partial', ranges: [{ start: 66, end: 66 }, { start: 99, end: 99 }] },
+                { path, kind: 'unresolved_calls', detail: '[{"caller":"CFSurfaceManager.DoDataExchange","leaf":"DDX_Control","reason":"function_not_in_registry"}]' },
+            ],
+        }] });
+        const index = buildCoverageIndex({ status, scopes: answer.scopes });
+        const record = index.records.get(path);
+        expect(record?.state).toBe('partial');
+        expect(record?.reason).toBe(inStatus ? '66-66,99-99' : 'Source lines: 66-66, 99-99');
+        expect(record?.sources).toEqual(inStatus
+            ? ['index_status.parse_partial', 'check_index_coverage.scope:.']
+            : ['check_index_coverage.scope:.']);
+        expect(index.counts.skipped).toBe(0);
+        expect(index.listingComplete).toBe(true);
+    });
+
+    it.each(['unresolved_calls', 'parse_unusable'])('does not turn a standalone %s record into absent source', (kind) => {
+        const scopes = readCoverageAnswer({ scopes: [{ scope: '.', entries: [{ path: 'src/diagnostic.cpp', kind, detail: 'graph evidence is incomplete' }] }] }).scopes;
+        expect(buildCoverageIndex({ scopes }).records.get('src/diagnostic.cpp')?.state).toBe('partial');
+    });
+
+    it.each(['extract', 'oversized'])('does not hide a real %s skip behind a partial parse', (kind) => {
+        const path = 'src/skipped.cpp';
+        const status = readIndexStatusCoverage({ parse_partial: { files: [{ path, error_ranges: '2-3' }], count: 1 } });
+        const scopes = readCoverageAnswer({ scopes: [{ scope: '.', entries: [{ path, kind, detail: 'source was skipped' }] }] }).scopes;
+        expect(buildCoverageIndex({ status, scopes }).records.get(path)).toMatchObject({ state: 'skipped', reason: 'source was skipped' });
+    });
 
     it('keeps unresolved status omissions when pages repeat rows, change totals, or cover only a subtree', () => {
         const status = readIndexStatusCoverage({ parse_partial: { files: [], count: 2, truncated: true } });

@@ -1,9 +1,24 @@
 import { describe, expect, it } from 'vitest';
 import { buildCoverageIndex, readCoverageAnswer } from '../app/tree-model';
 import type { CoverageRecord } from '../app/tree-model';
-import { diagnosticCategory, freshnessText, localDiagnosticReport } from './diagnostics-model';
+import { DIAGNOSTIC_LABELS, diagnosticAction, diagnosticCategory, freshnessText, localDiagnosticReport } from './diagnostics-model';
 
 describe('Existing index evidence in diagnostics', () => {
+    it('does not tell unresolved-only or unusable-parse readers to inspect nonexistent small ranges', () => {
+        const scopes = readCoverageAnswer({ scopes: [{ scope: '.', entries: [
+            { path: 'calls.c', kind: 'unresolved_calls', detail: '[{"caller":"gpd_open_indexed","leaf":"cbm_mkdir"}]' },
+            { path: 'unusable.c', kind: 'parse_unusable', detail: 'No usable syntax tree' },
+        ] }] }).scopes;
+        const index = buildCoverageIndex({ scopes });
+        expect(DIAGNOSTIC_LABELS.partial).toBe('Incomplete graph');
+        expect(diagnosticAction(index.records.get('calls.c')!)).toContain('call targets');
+        expect(diagnosticAction(index.records.get('calls.c')!)).not.toContain('reported source ranges');
+        expect(diagnosticAction(index.records.get('unusable.c')!)).toContain('whole file');
+        const report = localDiagnosticReport({ project: 'fixture', checkedAt: 'now', reading: { index, scopes, answer: readCoverageAnswer({}) } });
+        expect(report).toContain('Call graph incomplete');
+        expect(report).toContain('Parsing unavailable');
+        expect(report).not.toContain('"caller"');
+    });
     const row = (state: CoverageRecord['state'], reason: string): CoverageRecord => ({ path: 'src/a.unknown', kind: 'file', state, reason, sources: ['check_index_coverage'] });
     it('does not infer unsupported languages from paths or arbitrary skip messages', () => {
         expect(diagnosticCategory(row('skipped', 'read failed / read'))).toBe('skipped');

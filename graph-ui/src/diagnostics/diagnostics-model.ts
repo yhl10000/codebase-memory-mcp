@@ -1,9 +1,10 @@
 import type { CoverageReading } from '../app/coverage-source';
 import type { CoverageIndex, CoveragePathAnswer, CoverageRecord } from '../app/tree-model';
+import { partialCoverageSummary } from '../app/coverage-strings';
 
 export type DiagnosticCategory = 'partial' | 'excluded' | 'unsupported' | 'skipped' | 'unknown';
 export const DIAGNOSTIC_LABELS: Record<DiagnosticCategory, string> = {
-    partial: 'Partial parse', excluded: 'Excluded by index rules', unsupported: 'Unsupported language',
+    partial: 'Incomplete graph', excluded: 'Excluded by index rules', unsupported: 'Unsupported language',
     skipped: 'Indexing skipped', unknown: 'Unclassified coverage record',
 };
 
@@ -18,11 +19,17 @@ export function diagnosticCategory(record: CoverageRecord): DiagnosticCategory {
 
 export function diagnosticAction(record: CoverageRecord): string {
     const category = diagnosticCategory(record);
+    if (category === 'partial' && record.diagnostics?.parseUnusable) return 'Read the whole file directly; the parser could not establish reliable symbols or relationships.';
+    if (category === 'partial' && record.diagnostics?.unresolvedCalls && !record.diagnostics.parsePartial) return 'Verify call targets in the source before relying on callers, callees or graph paths.';
     if (category === 'partial') return 'Read the reported source ranges; verify missing symbols before relying on graph paths.';
     if (category === 'excluded') return 'Review the recorded exclusion rule; open the source directly or adjust that rule before reindexing.';
     if (category === 'unsupported') return 'Read this file directly; check parser support before requesting another index run.';
     if (category === 'skipped') return 'Inspect the recorded reason and source; correct the cause before reindexing.';
     return 'Inspect the existing coverage evidence; completeness cannot be inferred from this record.';
+}
+
+export function diagnosticReason(record: CoverageRecord): string {
+    return record.state === 'partial' ? partialCoverageSummary(record.reason, record.diagnostics) : record.reason || 'No reason recorded';
 }
 
 export function diagnosticRecords(index: CoverageIndex | null | undefined): CoverageRecord[] {
@@ -79,7 +86,7 @@ export function localDiagnosticReport(diagnosis: LocalDiagnosis): string {
     if (!records.length) lines.push('No gap records returned. Discovery omissions and unsupported files may be unrecorded.');
     for (const record of records.slice(0, 200)) {
         lines.push('', `- ${record.path} (${record.kind}): ${DIAGNOSTIC_LABELS[diagnosticCategory(record)]}`,
-            `  Recorded reason: ${record.reason || 'No reason recorded'}`,
+            `  Recorded reason: ${diagnosticReason(record)}`,
             `  Evidence source: ${record.sources.join(', ') || 'Not reported'}`,
             `  Next check: ${diagnosticAction(record)}`);
     }

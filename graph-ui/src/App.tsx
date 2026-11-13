@@ -817,7 +817,6 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
     // Requests of this window end with it: a switch to another project aborts them (K24).
     const client = useMemo(() => new RpcIntelligenceClient({ signal: projectWindow.signal }), [projectWindow.signal]);
     const api = useMemo(() => new AtlasApi({ signal: projectWindow.signal }), [projectWindow.signal]);
-    const [diagnosticsPath, setDiagnosticsPath] = useState<string>();
 
     /*
      * What the projects panel asks the server. The list comes over /rpc like
@@ -4064,7 +4063,7 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
         treeNoteParts.push('joining the coverage lists ...');
     } else {
         treeNoteParts.push(
-            `${coverage.counts.partial} partial, ${coverage.counts.skipped} skipped, `
+            `${coverage.counts.partial} parser-partial files, ${coverage.counts.skipped} skipped, `
             + `${coverage.counts.notIndexedFiles} files and ${coverage.counts.notIndexedDirs} folders `
             + `not indexed, ${coverage.counts.scopeEntries} coverage entries joined in`,
         );
@@ -4169,7 +4168,7 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
     const openRecord = coverage.records.get(activePath);
     const coverageNote =
         readerStatus === 'ready' && openRecord?.state === 'partial'
-            ? { state: 'partially parsed', text: partialFileNote(activePath, openRecord.reason) }
+            ? { state: 'incomplete graph', text: partialFileNote(activePath, openRecord.reason, openRecord.diagnostics) }
             : undefined;
 
     useEffect(() => {
@@ -4805,7 +4804,7 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
             workspace={workspace}
             projectSwitcher={<ProjectSwitcher currentProject={project} listProjects={projectsSource.listProjects}
                 onSelectProject={openProject} onAddProject={() => setProjectsOpen(true)} indexActivity={indexActivity} />}
-            onWorkspaceChange={value => { setDiagnosticsPath(undefined); changeWorkspace(value); }}
+            onWorkspaceChange={changeWorkspace}
             onOpenBrowserAi={openAgentSettings}
             onToggleBrowserAi={() => setBrowserAiOpen(open => !open)}
             agentState={localAgentState} agentModelName={agentModelName}
@@ -4883,7 +4882,7 @@ function ProjectWindowView({ projectWindow }: { projectWindow: ProjectWindow<Win
                 </div>
                 <div hidden={workspace !== 'coverage'}>
                     <DiagnosticsPanel project={project} client={client} coverage={coverageAsked ? coverage : undefined}
-                        coverageError={coverageError} active={workspace === 'coverage'} path={diagnosticsPath}
+                        coverageError={coverageError} active={workspace === 'coverage'} path={activePath || undefined}
                         indexDetails={<AtlasTreeIndexDetails rows={rows} note={treeNoteParts.join('; ')}
                             noteIsAbsence={treeError.length > 0 || coverageError.length > 0 || !project} truncations={coverage.truncations} />}
                         onNavigate={path => { changeWorkspace('explore'); navigateEvidence(path); }}

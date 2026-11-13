@@ -15,7 +15,7 @@
  *    Inhalt nichts weiss.
  */
 
-import type { CoverageState } from './tree-model';
+import type { CoverageDiagnostics, CoverageState } from './tree-model';
 
 /**
  * Der ehrliche Satz ueber die Grenze des Baums.
@@ -31,7 +31,7 @@ export const COVERAGE_SOURCE_NOTE =
 /** Das kurze Wort einer Stufe, so wie es in der Legende steht. */
 export const COVERAGE_LABELS: Record<CoverageState, string> = {
     indexed: 'indexed',
-    partial: 'partially parsed',
+    partial: 'incomplete graph',
     skipped: 'skipped',
     'not-indexed': 'not indexed',
     ignored: 'ignored',
@@ -57,29 +57,20 @@ export const COVERAGE_FOLDER_MARK = '●';
 /** Was die Legende zu einer Stufe sagt. */
 export const COVERAGE_DESCRIPTIONS: Record<CoverageState, string> = {
     indexed: 'in the graph, no recorded issue',
-    partial: 'indexed, but constructs in the listed line ranges may be missing',
+    partial: 'parser or call-resolution gaps; source may still be readable',
     skipped: 'the indexer gave up on it, with its own reason',
     'not-indexed': 'excluded by design (gitignore/.cbmignore), with the rule as the reason',
     ignored: 'the coverage store lists it as ignored',
 };
 
-/**
- * Der Tooltip einer Zeile.
- *
- * Der Grund wird angehaengt, wenn der Server einen genannt hat, und sonst
- * nicht. Der Wortlaut fuer `partial` nennt Zeilenbereiche statt einer Zahl von
- * Symbolen: der Server meldet Bereiche und keine Zahl, und "n symbols may be
- * missing" waere eine Zahl, die niemand gezaehlt hat.
- */
-export function coverageTooltip(state: CoverageState, reason = ''): string {
+/** Call diagnostics are not source line ranges. */
+export function coverageTooltip(state: CoverageState, reason = '', diagnostics?: CoverageDiagnostics): string {
     const trimmed = reason.trim();
     if (state === 'indexed') {
         return 'indexed: the graph carries this file and no source recorded an issue';
     }
     if (state === 'partial') {
-        return trimmed.length > 0
-            ? `partially parsed: constructs inside lines ${trimmed} may be missing from the graph`
-            : 'partially parsed: constructs inside the flagged ranges may be missing from the graph';
+        return partialCoverageSummary(reason, diagnostics);
     }
     if (state === 'skipped') {
         return trimmed.length > 0
@@ -135,14 +126,33 @@ export function readerUnavailableNote(path: string, state: CoverageState, reason
     );
 }
 
-/** Die Notiz ueber dem Editor, wenn nur Teile der Datei im Graphen stehen. */
-export function partialFileNote(path: string, reason = ''): string {
-    const trimmed = reason.trim();
-    return trimmed.length > 0
-        ? `${path} is only partially parsed: constructs inside lines ${trimmed} may be missing from the graph. `
-          + 'The text below is the file; the graph around it is incomplete.'
-        : `${path} is only partially parsed: constructs inside the flagged ranges may be missing from the graph. `
-          + 'The text below is the file; the graph around it is incomplete.';
+export function partialCoverageSummary(reason = '', diagnostics?: CoverageDiagnostics): string {
+    const raw = reason.trim().replace(/^Source lines:\s*/, '');
+    const validRanges = /^[1-9]\d*(?:-[1-9]\d*)?(?:\s*,\s*[1-9]\d*(?:-[1-9]\d*)?)*$/.test(raw);
+    const candidates = validRanges ? raw.split(/\s*,\s*/) : [];
+    const ranges = candidates.every(range => {
+        const [first, last = first] = range.split('-');
+        const start = Number(first), end = Number(last);
+        return Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start;
+    }) ? candidates : [];
+    const shown = ranges.slice(0, 8).join(',');
+    const rangeText = ranges.length > 8 ? `${shown}, … (${ranges.length} ranges; see Coverage)` : shown;
+    const parts: string[] = [];
+    if (diagnostics?.parseUnusable) {
+        parts.push('Parsing unavailable: the indexer could not build a usable syntax tree. Symbols and relationships may be missing throughout this file.');
+        if (rangeText) parts.push(`Reported parser ranges: ${rangeText}.`);
+    } else if (diagnostics?.parsePartial || ranges.length > 0 || !diagnostics?.unresolvedCalls) {
+        parts.push(rangeText
+            ? `partially parsed: constructs inside lines ${rangeText} may be missing from the graph.`
+            : 'partially parsed: the indexer reported parser gaps without usable line ranges.');
+    }
+    if (diagnostics?.unresolvedCalls) parts.push('Call graph incomplete: some call targets could not be resolved.');
+    return parts.join(' ');
+}
+
+/** Only shown after the reader has loaded source. */
+export function partialFileNote(path: string, reason = '', diagnostics?: CoverageDiagnostics): string {
+    return `${path}: ${partialCoverageSummary(reason, diagnostics)} The text below is the file; the graph around it is incomplete.`;
 }
 
 /**

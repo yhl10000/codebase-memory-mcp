@@ -79,7 +79,7 @@ describe('Shared persistent daemon event feed', () => {
         const onDiagnose = vi.fn();
         const coverage = buildCoverageIndex({ scopes: [{ requestedScope: '.', scope: '.', total: 2, status: 'complete', hasMore: false, entries: [{ path: 'broken.ts', kind: 'parse_partial', detail: '3-5' }, { path: 'vendor/', kind: 'not_indexed_dir', detail: 'gitignore' }] }] });
         await act(async () => root.render(<DaemonAlerts reading={{ data: readLogs({ lines: [], records: [], total: 0, persistent: true }), updatedAt: null, loading: false, error: null }} coverage={coverage} coverageKnown onDiagnose={onDiagnose} />));
-        expect(container.querySelector('.daemon-coverage-summary')?.textContent).toContain('1 partially parsed paths · 0 skipped · 1 intentionally excluded');
+        expect(container.querySelector('.daemon-coverage-summary')?.textContent).toContain('1 paths with index gaps · 0 skipped · 1 intentionally excluded');
         expect(container.textContent).not.toMatch(/\d+%/); expect(onDiagnose).not.toHaveBeenCalled();
     });
     it('shows the actual JSON message ahead of receipt metadata and retains raw evidence', async () => {

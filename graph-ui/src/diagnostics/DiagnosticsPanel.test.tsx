@@ -36,6 +36,44 @@ function clientFixture() {
 }
 
 describe('Local diagnosis user boundary', () => {
+    it('keeps full kind-labelled path evidence behind disclosure after local diagnosis', async () => {
+        const fixture = clientFixture();
+        const path = 'src/ranges.c';
+        const ranges = Array.from({ length: 12 }, (_, i) => ({ start: 100 + i, end: 100 + i }));
+        const coverage = [{ path, kind: 'parse_partial', ranges }, { path, kind: 'unresolved_calls', detail: '[{"caller":"source_function","leaf":"external_target"}]' }];
+        fixture.fetch.mockImplementation(async (_url, init) => {
+            const body = JSON.parse(String(init?.body));
+            const payload = body.params.name === 'index_status'
+                ? { parse_partial: { count: 1, files: [], truncated: true } }
+                : body.params.arguments.paths
+                    ? { paths: [{ path, status: 'partial', coverage }] }
+                    : { scopes: [{ scope: '.', total: 2, has_more: false, status: 'known_gaps', entries: coverage }] };
+            return { ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text: JSON.stringify(payload) }] } }) } as Response;
+        });
+        await act(async () => root.render(<DiagnosticsPanel project="fixture" client={fixture.client} path={path} active onNavigate={vi.fn()} />));
+        await click('Run local diagnosis');
+        const evidence = container.querySelector<HTMLDetailsElement>('.diagnostics-evidence');
+        expect(evidence).not.toBeNull();
+        expect(evidence?.open).toBe(false);
+        await act(async () => evidence?.querySelector('summary')?.click());
+        expect(evidence?.open).toBe(true);
+        expect(evidence?.textContent).toContain('parse_partial');
+        expect(evidence?.textContent).toContain('108-108');
+        expect(evidence?.textContent).toContain('111-111');
+        expect(evidence?.textContent).toContain('unresolved_calls');
+        expect(evidence?.textContent).toContain('external_target');
+        expect(container.querySelector('textarea')?.value).toContain('111-111');
+    });
+
+    it('renders call-resolution evidence as a short graph warning, not a parse-range claim', async () => {
+        const fixture = clientFixture();
+        const entries = [{ path: 'calls.c', kind: 'unresolved_calls', detail: '[{"caller":"gpd_open_indexed","leaf":"cbm_mkdir"}]' }];
+        const coverage = buildCoverageIndex({ scopes: [{ scope: '.', requestedScope: '.', status: 'complete', total: 1, hasMore: false, entries }] });
+        await act(async () => root.render(<DiagnosticsPanel project="fixture" client={fixture.client} coverage={coverage} active onNavigate={vi.fn()} />));
+        expect(container.textContent).toContain('Incomplete graph: 1');
+        expect(container.querySelector('.diagnostics-records')?.textContent).toContain('Call graph incomplete');
+        expect(container.querySelector('.diagnostics-records')?.textContent).not.toMatch(/"caller"|reported source ranges/);
+    });
     it('keeps recorded paths collapsed, pages all records and preserves source navigation without search', async () => {
         const fixture = clientFixture(); const onNavigate = vi.fn();
         const entries = Array.from({ length: 101 }, (_, index) => ({ path: `src/file-${String(index).padStart(3, '0')}.ts`, kind: 'parse_partial', detail: '3-5' }));

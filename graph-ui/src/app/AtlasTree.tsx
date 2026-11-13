@@ -129,7 +129,7 @@ export function dotToneOf(state: CoverageState): 'indexed' | 'partial' | 'absent
 /** Der Tooltip einer Zeile. */
 export function titleFor(row: TreeRow): string {
     const state = coverageOf(row);
-    return row.kind === 'dir' ? folderTooltip(state) : coverageTooltip(state, row.coverageReason ?? '');
+    return row.kind === 'dir' ? folderTooltip(state) : coverageTooltip(state, row.coverageReason ?? '', row.coverageDiagnostics);
 }
 
 /** Die Stufen, die in diesen Zeilen wirklich vorkommen, in ihrer Ordnung. */

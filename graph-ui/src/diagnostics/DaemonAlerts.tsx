@@ -57,7 +57,7 @@ export default function DaemonAlerts({ reading, onDiagnose, coverage, coverageKn
         const partial = rows.filter((row) => row.state === 'partial').length;
         const excluded = rows.filter((row) => diagnosticCategory(row) === 'excluded').length;
         const skipped = rows.filter((row) => row.state === 'skipped').length;
-        return `Index coverage: ${partial} partially parsed paths · ${skipped} skipped · ${excluded} intentionally excluded${coverage.truncations.length ? ' · detail listing incomplete' : ''}.`;
+        return `Index coverage: ${partial} paths with index gaps · ${skipped} skipped · ${excluded} intentionally excluded${coverage.truncations.length ? ' · detail listing incomplete' : ''}.`;
     }, [coverage, coverageKnown, coverageError]);
     return <section className={`daemon-alerts${newErrors.length || reading.error ? ' daemon-alerts-has-errors' : ''}${expanded ? ' daemon-alerts-expanded' : ' daemon-alerts-collapsed'}`} aria-label="Daemon errors and warnings" data-testid="daemon-alerts">
         <div className="daemon-alerts-heading">

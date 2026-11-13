@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AtlasTree, { AtlasTreeIndexDetails, twistyFor } from './AtlasTree';
 import type { AtlasTreeProps } from './AtlasTree';
 import type { TreeRow } from './tree-model';
+import { buildCoverageIndex, flattenTree, mergeCoverageIntoLevels, readCoverageAnswer, readIndexStatusCoverage, readTreeLevel } from './tree-model';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -167,6 +168,45 @@ const withCoverage = (row: TreeRow, coverage: TreeRow['coverage'], reason?: stri
 });
 
 describe('AtlasTree und die Coverage-Stufen', () => {
+
+    it('shows a compact call-graph warning rather than calling unresolved JSON parser lines', async () => {
+        const path = 'tests/test_grammar_probe_d.c';
+        const coverage = buildCoverageIndex({ scopes: readCoverageAnswer({ scopes: [{ scope: '.', entries: [{
+            path, kind: 'unresolved_calls', detail: '[{"caller":"codebase-memory.tests.test_grammar_probe_d.gpd_open_indexed","leaf":"cbm_project_name_from_path","reason":"function_not_in_registry"}]',
+        }] }] }).scopes });
+        const levels = new Map([['tests', readTreeLevel({ path: 'tests', children: [{ name: 'test_grammar_probe_d.c', path, kind: 'file', files: 1, symbols: 80 }] })]]);
+        const onOpen = vi.fn();
+        await render(props({ rows: flattenTree(mergeCoverageIntoLevels(levels, coverage), new Set(), 'tests'), onOpen }));
+        const target = rows()[0];
+        expect(target?.getAttribute('data-coverage')).toBe('partial');
+        expect(target?.getAttribute('data-hint')).toContain('Call graph incomplete');
+        expect(target?.getAttribute('data-hint')).not.toMatch(/"caller"|inside lines|partially parsed/);
+        await act(async () => target?.click());
+        expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ path, coverage: 'partial' }));
+    });
+
+    it('shows a partial marker and opens a file whose calls are unresolved', async () => {
+        const path = 'ContourUI/fsurfacemanager.cpp';
+        const coverage = buildCoverageIndex({
+            status: readIndexStatusCoverage({ parse_partial: { files: [{ path, error_ranges: '66-66,99-99' }], count: 1 } }),
+            scopes: readCoverageAnswer({ scopes: [{ scope: '.', entries: [
+                { path, kind: 'parse_partial', ranges: [{ start: 66, end: 66 }, { start: 99, end: 99 }] },
+                { path, kind: 'unresolved_calls', detail: '[{"leaf":"DDX_Control","reason":"function_not_in_registry"}]' },
+            ] }] }).scopes,
+        });
+        const levels = new Map([
+            ['', readTreeLevel({ path: '', children: [{ name: 'ContourUI', path: 'ContourUI', kind: 'dir', symbols: 43, files: 1 }] })],
+            ['ContourUI', readTreeLevel({ path: 'ContourUI', children: [{ name: 'fsurfacemanager.cpp', path, kind: 'file', symbols: 43, files: 1 }] })],
+        ]);
+        const onOpen = vi.fn();
+        await render(props({ rows: flattenTree(mergeCoverageIntoLevels(levels, coverage), new Set(['ContourUI'])), onOpen }));
+        const target = rows().find(row => row.getAttribute('data-path') === path);
+        expect(target?.getAttribute('data-coverage')).toBe('partial');
+        expect(target?.querySelector('[data-testid="atlas-tree-mark"]')?.textContent).toBe('!');
+        expect(target?.getAttribute('data-hint')).not.toContain('DDX_Control');
+        await act(async () => target?.click());
+        expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ path, coverage: 'partial' }));
+    });
 
     const coveredRows = [
         withCoverage(dir('src', true), 'partial'),
