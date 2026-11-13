@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <uchar.h>
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
 #ifdef _WIN32
 #include <direct.h>
@@ -7678,6 +7679,193 @@ static char *snippet_process_order(cbm_mcp_server_t *srv, yyjson_doc **doc) {
     return inner;
 }
 
+static int snippet_encoding_fixture(cbm_mcp_server_t *srv, const char *tmp, const char *rel,
+                                    const char *raw, size_t length, bool verified) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/%s", tmp, rel);
+    FILE *file = fopen(path, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(fwrite(raw, 1, length, file), length);
+    ASSERT_EQ(fclose(file), 0);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(path, &info), 0);
+    char sha[CBM_SHA256_HEX_LEN + 1] = "";
+    if (verified) {
+        cbm_sha256_hex(raw, length, sha);
+    }
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    if (verified) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", rel, sha, info.mtime_ns, info.size),
+                  CBM_STORE_OK);
+    } else {
+        ASSERT_EQ(cbm_store_delete_file_hash(store, "test-project", rel), CBM_STORE_OK);
+    }
+    cbm_node_t node = {.project = "test-project", .label = "Section", .name = "EncodingGuide",
+                       .qualified_name = "test-project.EncodingGuide", .file_path = rel,
+                       .start_line = 1, .end_line = 4,
+                       .properties_json = "{\"docstring\":\"PDF text layer\"}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    PASS();
+}
+
+static char *snippet_encoding_json(cbm_mcp_server_t *srv, int start, int lines, yyjson_doc **doc) {
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"test-project\","
+                                 "\"qualified_name\":\"test-project.EncodingGuide\","
+                                 "\"format\":\"json\",\"start_line\":%d,\"max_lines\":%d}", start, lines);
+    char *response = cbm_mcp_handle_tool(srv, "get_code_snippet", args);
+    char *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    return inner;
+}
+
+TEST(tool_get_code_snippet_utf16_documents_use_verified_raw_bytes) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char utf8[] = "# Guide\r\n\r\nUse \xc3\xa9 \xf0\x9f\x98\x80 `C:\\repo\\main.py`.\r\nNext line.\r\n";
+    const char16_t units[] = u"# Guide\r\n\r\nUse \u00e9 \U0001f600 `C:\\repo\\main.py`.\r\nNext line.\r\n";
+#ifdef _WIN32
+    const char expected[] = "Use \xc3\xa9 \xf0\x9f\x98\x80 `C:\\repo\\main.py`.\nNext line.\n";
+#else
+    const char expected[] = "Use \xc3\xa9 \xf0\x9f\x98\x80 `C:\\repo\\main.py`.\r\nNext line.\r\n";
+#endif
+    const char *paths[] = {"encoding.md", "encoding.rst", "encoding.adoc"};
+    for (size_t p = 0; p < sizeof(paths) / sizeof(paths[0]); p++) {
+        for (int encoding = 0; encoding < 4; encoding++) {
+            char raw[512];
+            size_t length;
+            if (encoding < 2) {
+                length = sizeof(utf8) - 1 + (encoding ? 3 : 0);
+                memcpy(raw, "\xef\xbb\xbf", 3);
+                memcpy(raw + (encoding ? 3 : 0), utf8, sizeof(utf8) - 1);
+            } else {
+                bool be = encoding == 3;
+                raw[0] = be ? (char)0xfe : (char)0xff;
+                raw[1] = be ? (char)0xff : (char)0xfe;
+                length = 2 + sizeof(units) - sizeof(units[0]);
+                for (size_t i = 0; i < sizeof(units) / sizeof(units[0]) - 1; i++) {
+                    raw[2 + 2 * i + be] = (char)(units[i] & 0xff);
+                    raw[2 + 2 * i + !be] = (char)(units[i] >> 8);
+                }
+            }
+            for (int verified = 0; verified < 2; verified++) {
+                ASSERT_EQ(snippet_encoding_fixture(srv, tmp, paths[p], raw, length, verified), 0);
+                yyjson_doc *doc = NULL;
+                char *inner = snippet_encoding_json(srv, 3, 2, &doc);
+                ASSERT_NOT_NULL(doc);
+                yyjson_val *root = yyjson_doc_get_root(doc);
+                ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(root, "content_verified")), verified);
+                ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "source")), expected);
+                yyjson_doc_free(doc);
+                free(inner);
+                inner = snippet_encoding_json(srv, 1, 1, &doc);
+                ASSERT_NOT_NULL(doc);
+                const char *source = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source"));
+                ASSERT_NOT_NULL(source);
+                ASSERT_TRUE(strncmp(source, encoding == 1 ? "\xef\xbb\xbf# Guide" : "# Guide",
+                                    encoding == 1 ? 10 : 7) == 0);
+                yyjson_doc_free(doc);
+                free(inner);
+            }
+        }
+        char path[512];
+        snprintf(path, sizeof(path), "%s/project/%s", tmp, paths[p]);
+        ASSERT_EQ(cbm_unlink(path), 0);
+    }
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_code_snippet_utf16_failures_and_binary_gate) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char invalid[][4] = {{(char)0xff, (char)0xfe, 0, (char)0xd8},
+                               {(char)0xfe, (char)0xff, 0},
+                               {(char)0xff, (char)0xfe, 0, 0}};
+    const size_t lengths[] = {4, 3, 4};
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        for (int verified = 0; verified < 2; verified++) {
+            ASSERT_EQ(snippet_encoding_fixture(srv, tmp, "encoding.md", invalid[i], lengths[i],
+                                               verified), 0);
+            yyjson_doc *doc = NULL;
+            char *inner = snippet_encoding_json(srv, 1, 4, &doc);
+            ASSERT_NOT_NULL(doc);
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "source")), "(source not available)");
+            ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(root, "content_verified")), verified);
+            yyjson_doc_free(doc);
+            free(inner);
+        }
+    }
+    const char raw[] = "\xff\xfe" "RAW\n";
+    const char *paths[] = {"encoding.py", "encoding.pdf"};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        ASSERT_EQ(snippet_encoding_fixture(srv, tmp, paths[i], raw, sizeof(raw) - 1, true), 0);
+        yyjson_doc *doc = NULL;
+        char *inner = snippet_encoding_json(srv, 1, 4, &doc);
+        ASSERT_NOT_NULL(doc);
+        const char *source = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source"));
+        ASSERT_NOT_NULL(source);
+        ASSERT_NOT_NULL(strstr(source, i == 0 ? "RAW" : "PDF text layer"));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    const char *cleanup[] = {"encoding.md", "encoding.py", "encoding.pdf"};
+    for (size_t i = 0; i < sizeof(cleanup) / sizeof(cleanup[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/project/%s", tmp, cleanup[i]);
+        ASSERT_EQ(cbm_unlink(path), 0);
+    }
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_code_snippet_utf16_obeys_source_size_limit) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char raw[] = {(char)0xff, (char)0xfe, 0x2d, 0x4e, 0x2d, 0x4e, 0x2d, 0x4e};
+    ASSERT_EQ(snippet_encoding_fixture(srv, tmp, "encoding.md", raw, sizeof(raw), true), 0);
+    const char *previous = getenv("CBM_MAX_FILE_BYTES");
+    char *saved = previous ? strdup(previous) : NULL;
+    for (int cap = 7; cap <= 8; cap++) {
+        ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", cap == 7 ? "7" : "8", 1), 0);
+        yyjson_doc *doc = NULL;
+        char *inner = snippet_encoding_json(srv, 1, 4, &doc);
+        ASSERT_NOT_NULL(doc);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source")),
+                      "(source not available)");
+        ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(doc), "content_verified")), cap == 8);
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    const char plain[] = "# Plain\r\n\r\nline3\r\nline4\r\n";
+    ASSERT_EQ(snippet_encoding_fixture(srv, tmp, "encoding.md", plain, sizeof(plain) - 1, false), 0);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_encoding_json(srv, 3, 2, &doc);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source")), "line3"));
+    yyjson_doc_free(doc);
+    free(inner);
+    if (saved) {
+        ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", saved, 1), 0);
+    } else {
+        ASSERT_EQ(cbm_unsetenv("CBM_MAX_FILE_BYTES"), 0);
+    }
+    free(saved);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/encoding.md", tmp);
+    ASSERT_EQ(cbm_unlink(path), 0);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* #2585 (and #1750): the snippet's line range is the indexed range. When the
  * file's bytes are not the indexed bytes, the same range can hold another
  * symbol's code, so the source is withheld rather than misattributed. */
@@ -7777,6 +7965,98 @@ TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585) {
     yyjson_doc_free(doc);
     free(inner);
 
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_code_snippet_utf16_serves_captured_bytes_after_rewrite) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    const char16_t units[] = u"# Guide\r\n\r\nUse `old/path.py`.\r\nNext line.\r\n";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/encoding.md", tmp);
+    for (int be = 0; be < 2; be++) {
+        char raw[sizeof(units)];
+        raw[0] = be ? (char)0xfe : (char)0xff;
+        raw[1] = be ? (char)0xff : (char)0xfe;
+        for (size_t i = 0; i < sizeof(units) / sizeof(units[0]) - 1; i++) {
+            raw[2 + 2 * i + be] = (char)(units[i] & 0xff);
+            raw[2 + 2 * i + !be] = (char)(units[i] >> 8);
+        }
+        ASSERT_EQ(snippet_encoding_fixture(srv, tmp, "encoding.md", raw, sizeof(raw), true), 0);
+        cbm_mcp_server_set_snippet_capture_test_hook(srv, snippet_capture_rewrite, path);
+        yyjson_doc *doc = NULL;
+        char *inner = snippet_encoding_json(srv, 3, 2, &doc);
+        cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+        const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+        ASSERT_NOT_NULL(source);
+        ASSERT_NOT_NULL(strstr(source, "old/path.py"));
+        ASSERT_NULL(strstr(source, "Intruder"));
+        yyjson_doc_free(doc);
+        free(inner);
+        inner = snippet_encoding_json(srv, 3, 2, &doc);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    ASSERT_EQ(cbm_unlink(path), 0);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_code_snippet_utf16_allocation_failure_is_read_only) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char raw[] = {(char)0xff, (char)0xfe, '#', 0, ' ', 0, 'G', 0, 13, 0, 10, 0,
+                        13, 0, 10, 0, 'o', 0, 'k', 0, 13, 0, 10, 0};
+    for (int verified = 0; verified < 2; verified++) {
+        ASSERT_EQ(snippet_encoding_fixture(srv, tmp, "encoding.md", raw, sizeof(raw), verified), 0);
+        int nodes = cbm_store_count_nodes(store, "test-project");
+        int edges = cbm_store_count_edges(store, "test-project");
+        cbm_file_hash_t before = {0};
+        int hash_status = cbm_store_get_file_hash(store, "test-project", "encoding.md", &before);
+        cbm_text_view_fail_next_alloc_for_tests();
+        yyjson_doc *doc = NULL;
+        char *inner = snippet_encoding_json(srv, 3, 2, &doc);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "source")), "(source not available)");
+        ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(root, "content_verified")), verified);
+        yyjson_doc_free(doc);
+        free(inner);
+        ASSERT_EQ(cbm_store_count_nodes(store, "test-project"), nodes);
+        ASSERT_EQ(cbm_store_count_edges(store, "test-project"), edges);
+        cbm_file_hash_t after = {0};
+        ASSERT_EQ(cbm_store_get_file_hash(store, "test-project", "encoding.md", &after), hash_status);
+        if (verified) {
+            ASSERT_STR_EQ(after.sha256, before.sha256);
+            ASSERT_EQ(after.mtime_ns, before.mtime_ns);
+            ASSERT_EQ(after.size, before.size);
+        }
+        cbm_store_clear_file_hash(&before);
+        cbm_store_clear_file_hash(&after);
+        inner = snippet_encoding_json(srv, 3, 2, &doc);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "ok"));
+        ASSERT_EQ(yyjson_get_bool(yyjson_obj_get(root, "content_verified")), verified);
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/encoding.md", tmp);
+    ASSERT_EQ(cbm_unlink(path), 0);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -28204,6 +28484,11 @@ SUITE(mcp) {
     RUN_TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585);
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585);
+    RUN_TEST(tool_get_code_snippet_utf16_serves_captured_bytes_after_rewrite);
+    RUN_TEST(tool_get_code_snippet_utf16_allocation_failure_is_read_only);
+    RUN_TEST(tool_get_code_snippet_utf16_documents_use_verified_raw_bytes);
+    RUN_TEST(tool_get_code_snippet_utf16_failures_and_binary_gate);
+    RUN_TEST(tool_get_code_snippet_utf16_obeys_source_size_limit);
 #endif
     RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);

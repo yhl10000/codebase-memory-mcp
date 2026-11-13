@@ -1,8 +1,7 @@
 /*
  * str_util.h — Safe string operations.
  *
- * All functions that return char* allocate via the provided arena
- * (no malloc, no free needed).
+ * String-returning functions allocate via the provided arena; text views own decoded buffers.
  */
 #ifndef CBM_STR_UTIL_H
 #define CBM_STR_UTIL_H
@@ -10,6 +9,23 @@
 #include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
+
+typedef enum { CBM_TEXT_VIEW_OK, CBM_TEXT_VIEW_INVALID, CBM_TEXT_VIEW_OOM } cbm_text_view_status_t;
+typedef enum { CBM_TEXT_UTF8, CBM_TEXT_UTF16_LE, CBM_TEXT_UTF16_BE } cbm_text_encoding_t;
+typedef struct {
+    const char *data;
+    size_t length;
+    char *owned;
+    cbm_text_encoding_t encoding;
+} cbm_text_view_t;
+
+/* UTF-8 borrows raw unchanged; BOM UTF-16 owns UTF-8. Keep raw alive until release. */
+/* Rejects NUL, malformed UTF-16 and lengths above INT_MAX; callers gate text versus binary. */
+cbm_text_view_status_t cbm_text_view_init(const char *raw, size_t length, cbm_text_view_t *out);
+void cbm_text_view_release(cbm_text_view_t *view);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_text_view_fail_next_alloc_for_tests(void);
+#endif
 
 /* Join two path components with '/'. Handles trailing/leading slashes. */
 char *cbm_path_join(CBMArena *a, const char *base, const char *name);

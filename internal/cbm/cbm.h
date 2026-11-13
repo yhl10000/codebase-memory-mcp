@@ -1213,6 +1213,7 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
+// Markdown, RST and AsciiDoc decode BOM UTF-16. Code and binary importers retain raw bytes.
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the
 // calling thread's CPU time, with a wall-clock backstop of
 // CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).

@@ -31,6 +31,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
 #include "foundation/mem_core.h"
+#include "foundation/str_util.h"
 #include "foundation/dyn_array.h"
 
 #include <stdbool.h>
@@ -39,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdatomic.h>
 
 #define SLEN(s) (sizeof(s) - SKIP_ONE)
 
@@ -125,6 +127,9 @@ static char *doclink_read_file(const char *path, long *out_size, cbm_read_status
         nread = (size_t)size;
     }
     buf[nread] = '\0';
+    if (out_size) {
+        *out_size = (long)nread;
+    }
     return buf;
 }
 
@@ -483,11 +488,11 @@ static bool doclink_has_doc_files(const cbm_gbuf_node_t *const *files, int file_
  * file — on a docs-heavy repo this is the whole pass's cancel latency —
  * and every skip is reported via cbm_pipeline_add_file_error, never
  * silent. */
-static void doclink_scan_repo(cbm_pipeline_ctx_t *ctx, doclink_ctx_t *dc, const char *repo_path,
-                              const cbm_gbuf_node_t *const *files, int file_count, int *md_edges) {
+static int doclink_scan_repo(cbm_pipeline_ctx_t *ctx, doclink_ctx_t *dc, const char *repo_path,
+                             const cbm_gbuf_node_t *const *files, int file_count, int *md_edges) {
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            return;
+            return 0;
         }
         if (!files[i]->file_path || !doclink_is_markdown_path(files[i]->file_path)) {
             continue;
@@ -519,10 +524,28 @@ static void doclink_scan_repo(cbm_pipeline_ctx_t *ctx, doclink_ctx_t *dc, const 
             /* CBM_READ_EMPTY: benign 0-byte file, nothing to index, not reported. */
             continue;
         }
-        int emitted = doclink_scan_file(dc, files[i], source);
+        cbm_text_view_t text = {0};
+        cbm_text_view_status_t status = cbm_text_view_init(source, (size_t)file_size, &text);
+        if (status == CBM_TEXT_VIEW_OOM) {
+            atomic_store(&ctx->source_oom, true);
+            cbm_log_error("pipeline.source_oom", "phase", "doclinks", "path", files[i]->file_path);
+            cbm_text_view_release(&text);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        if (status != CBM_TEXT_VIEW_OK || text.length > (size_t)cbm_max_file_bytes()) {
+            cbm_pipeline_add_file_error(ctx->pipeline, files[i]->file_path,
+                                        "invalid or oversized text encoding", "extract");
+            cbm_text_view_release(&text);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+            continue;
+        }
+        int emitted = doclink_scan_file(dc, files[i], text.owned ? text.owned : source);
+        cbm_text_view_release(&text);
         cbm_free(CBM_MEM_CLASS_EXTRACT, source);
         *md_edges += emitted;
     }
+    return 0;
 }
 
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx) {
@@ -559,9 +582,12 @@ int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx) {
     }
 
     int md_edges = 0;
-    doclink_scan_repo(ctx, &dc, ctx->repo_path, files, file_count, &md_edges);
+    int rc = doclink_scan_repo(ctx, &dc, ctx->repo_path, files, file_count, &md_edges);
     cbm_da_free(&dc.matches);
     cbm_ht_free(dc.files_by_path);
+    if (rc != 0) {
+        return rc;
+    }
 
     char buf1[CBM_SZ_16];
     (void)snprintf(buf1, sizeof(buf1), "%d", md_edges);

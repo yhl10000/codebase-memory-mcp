@@ -41,6 +41,7 @@ enum {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
  * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
@@ -1481,13 +1482,27 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
         }
         return NULL;
     }
-    CBMFileResult *r =
-        cbm_pipeline_test_force_extract_null(ctx, fi->language)
-            ? NULL
-            : cbm_extract_file_ex_with_tests(
-                  src, slen, fi->language, ctx->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
-                  NULL, NULL, ctx->macro_table, ctx->return_type_table, ctx->test_declarations);
-    free(src);
+    char *raw_source = src;
+    cbm_text_view_t text = {0};
+    cbm_text_view_status_t text_status =
+        cbm_pipeline_normalize_source(fi->language, &src, &slen, &text);
+    if (text_status == CBM_TEXT_VIEW_OOM) {
+        atomic_store(&ctx->source_oom, true);
+        cbm_log_error("pipeline.source_oom", "phase", "calls_fallback", "path", fi->rel_path);
+    }
+    CBMFileResult *r = NULL;
+    if (text_status != CBM_TEXT_VIEW_OK) {
+        r = cbm_pipeline_text_error_result(fi->language, text_status);
+    } else if (!cbm_pipeline_test_force_extract_null(ctx, fi->language)) {
+        r = cbm_extract_file_ex_with_tests(src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
+                                           ctx->return_type_table, ctx->test_declarations);
+    }
+    cbm_text_view_release(&text);
+    free(raw_source);
+    if (text_status == CBM_TEXT_VIEW_OOM) {
+        return NULL;
+    }
     (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, r);
     if (r) {
         *owned = true;
@@ -1522,6 +1537,9 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         bool result_owned = false;
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
+            if (atomic_load(&ctx->source_oom)) {
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            }
             if (atomic_load(&ctx->test_declarations_failed)) {
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }

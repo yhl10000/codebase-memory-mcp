@@ -15,6 +15,7 @@
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
+#include "store/store.h"
 #include "discover/discover.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
@@ -31,6 +32,286 @@
 /* ── Helper: create temp test repo ───────────────────────────────── */
 
 static char g_par_tmpdir[256];
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static const unsigned char source_oom_document[] = {
+    0xff, 0xfe, '#', 0, ' ', 0, 'O', 0, 'O', 0, 'M', 0, '\r', 0, '\n', 0};
+
+static bool source_oom_fixture(char *repo, size_t repo_cap, char *path, size_t path_cap) {
+    const char *dir = th_mktempdir("cbm-decoded-source-oom");
+    if (!dir || strlen(dir) >= repo_cap) return false;
+    snprintf(repo, repo_cap, "%s", dir);
+    snprintf(path, path_cap, "%s/doc.md", repo);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) return false;
+    bool ok = fwrite(source_oom_document, 1, sizeof(source_oom_document), fp) == sizeof(source_oom_document);
+    return fclose(fp) == 0 && ok;
+}
+
+typedef struct { int sections; bool dumped; } source_oom_probe_t;
+static void source_oom_count_sections(const cbm_gbuf_node_t *node, void *opaque) {
+    source_oom_probe_t *probe = opaque;
+    if (node->label && strcmp(node->label, "Section") == 0) probe->sections++;
+}
+static void source_oom_before_dump(const cbm_gbuf_t *gbuf, void *opaque) {
+    source_oom_probe_t *probe = opaque;
+    probe->dumped = true;
+    cbm_gbuf_foreach_node(gbuf, source_oom_count_sections, probe);
+}
+static void source_oom_consume_pending_fault(void) {
+    cbm_text_view_t view = {0};
+    (void)cbm_text_view_init((const char *)source_oom_document, sizeof(source_oom_document), &view);
+    cbm_text_view_release(&view);
+}
+
+static bool source_oom_content_digest(const char *db, unsigned char out[CBM_SZ_32]) {
+    cbm_store_t *store = cbm_store_open_path_query(db);
+    if (!store) {
+        return false;
+    }
+    bool ok = cbm_store_graph_content_digest(store, "sourceoom", out) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ok;
+}
+
+TEST(parallel_decoded_alloc_fault_is_utf16_only_and_one_shot) {
+    cbm_text_view_t view = {0};
+    cbm_text_view_fail_next_alloc_for_tests();
+    cbm_text_view_status_t borrowed = cbm_text_view_init("utf8", 4, &view);
+    cbm_text_view_release(&view);
+    cbm_text_view_status_t invalid =
+        cbm_text_view_init((const char *)source_oom_document, 3, &view);
+    cbm_text_view_release(&view);
+    cbm_text_view_status_t failed =
+        cbm_text_view_init((const char *)source_oom_document, sizeof(source_oom_document), &view);
+    cbm_text_view_release(&view);
+    cbm_text_view_status_t recovered =
+        cbm_text_view_init((const char *)source_oom_document, sizeof(source_oom_document), &view);
+    cbm_text_view_release(&view);
+    ASSERT_EQ(borrowed, CBM_TEXT_VIEW_OK);
+    ASSERT_EQ(invalid, CBM_TEXT_VIEW_INVALID);
+    ASSERT_EQ(failed, CBM_TEXT_VIEW_OOM);
+    ASSERT_EQ(recovered, CBM_TEXT_VIEW_OK);
+    PASS();
+}
+
+TEST(parallel_decoded_oom_cannot_publish_missing_document) {
+    char repo[1024] = {0}, path[1200], added[1200], control_db[1200], invalid_db[1200];
+    bool setup = source_oom_fixture(repo, sizeof(repo), path, sizeof(path));
+    snprintf(control_db, sizeof(control_db), "%s/control.db", repo);
+    snprintf(added, sizeof(added), "%s/added.md", repo);
+    snprintf(invalid_db, sizeof(invalid_db), "%s/invalid.db", repo);
+    source_oom_probe_t control = {0}, failed = {0}, invalid = {0};
+    cbm_pipeline_t *p = setup ? cbm_pipeline_new(repo, control_db, CBM_MODE_FULL) : NULL;
+    bool control_named = p && cbm_pipeline_set_project_name(p, "sourceoom");
+    if (p)
+        cbm_pipeline_set_before_dump_hook_for_tests(p, source_oom_before_dump, &control);
+    int control_rc = control_named ? cbm_pipeline_run(p) : -999;
+    cbm_pipeline_free(p);
+    unsigned char before[CBM_SZ_32], after[CBM_SZ_32];
+    bool before_ok = control_rc == 0 && source_oom_content_digest(control_db, before);
+    FILE *extra = setup ? cbm_fopen(added, "wb") : NULL;
+    bool extended = extra && fwrite(source_oom_document, 1, sizeof(source_oom_document), extra) ==
+                                 sizeof(source_oom_document);
+    if (extra && fclose(extra) != 0) {
+        extended = false;
+    }
+    p = before_ok && extended ? cbm_pipeline_new(repo, control_db, CBM_MODE_FULL) : NULL;
+    bool failed_named = p && cbm_pipeline_set_project_name(p, "sourceoom");
+    if (failed_named) {
+        cbm_pipeline_set_before_dump_hook_for_tests(p, source_oom_before_dump, &failed);
+        cbm_text_view_fail_next_alloc_for_tests();
+    }
+    int failed_rc = failed_named ? cbm_pipeline_run(p) : -999;
+    cbm_pipeline_free(p);
+    bool live_preserved = before_ok && source_oom_content_digest(control_db, after) &&
+                          memcmp(before, after, sizeof(before)) == 0;
+    source_oom_consume_pending_fault();
+    FILE *fp = setup ? cbm_fopen(path, "wb") : NULL;
+    bool malformed = fp && fwrite(source_oom_document, 1, 3, fp) == 3;
+    if (fp && fclose(fp) != 0)
+        malformed = false;
+    p = malformed ? cbm_pipeline_new(repo, invalid_db, CBM_MODE_FULL) : NULL;
+    if (p)
+        cbm_pipeline_set_before_dump_hook_for_tests(p, source_oom_before_dump, &invalid);
+    int invalid_rc = p ? cbm_pipeline_run(p) : -999;
+    cbm_pipeline_free(p);
+    bool cleanup = !repo[0] || th_rmtree(repo) == 0;
+    printf(
+        "  decoded OOM publication: control_rc=%d sections=%d failed_rc=%d dumped=%d sections=%d\n",
+        control_rc, control.sections, failed_rc, failed.dumped, failed.sections);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(cleanup);
+    ASSERT_EQ(control_rc, 0);
+    ASSERT_TRUE(control.dumped);
+    ASSERT_GT(control.sections, 0);
+    ASSERT_TRUE(extended);
+    ASSERT_TRUE(live_preserved);
+    ASSERT_EQ(failed_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_FALSE(failed.dumped);
+    ASSERT_TRUE(malformed);
+    ASSERT_EQ(invalid_rc, 0);
+    ASSERT_TRUE(invalid.dumped);
+    PASS();
+}
+
+TEST(parallel_decoded_oom_aborts_each_source_consumer) {
+    char repo[1024] = {0}, path[1200];
+    bool setup = source_oom_fixture(repo, sizeof(repo), path, sizeof(path));
+    cbm_file_info_t file = {.path = path,
+                            .rel_path = "doc.md",
+                            .language = CBM_LANG_MARKDOWN,
+                            .size = sizeof(source_oom_document)};
+    int results[5] = {-999, -999, -999, -999, -999};
+    bool no_fake_owner_failure = true;
+    bool fatal_latched = true;
+    CBMHashTable *saved_nsmap = cbm_pipeline_get_nsmap();
+    cbm_pipeline_set_nsmap(NULL);
+    for (int route = 0; setup && route < 5; route++) {
+        atomic_int cancelled;
+        atomic_init(&cancelled, 0);
+        _Atomic int64_t ids;
+        atomic_init(&ids, 1);
+        CBMFileResult *cache[1] = {0};
+        cbm_pipeline_ctx_t ctx = {.project_name = "sourceoom",
+                                  .repo_path = repo,
+                                  .cancelled = &cancelled,
+                                  .result_cache = route < 3 ? cache : NULL};
+        ctx.gbuf = cbm_gbuf_new(ctx.project_name, repo);
+        ctx.registry = cbm_registry_new();
+        setup = ctx.gbuf && ctx.registry;
+        if (setup) {
+            cbm_text_view_fail_next_alloc_for_tests();
+            if (route == 0) {
+                cbm_parallel_extract_opts_t opts = {.retain_sources = true,
+                                                    .retain_sources_set = true};
+                results[route] = cbm_parallel_extract_ex(&ctx, &file, 1, cache, &ids, 2, &opts);
+            } else if (route == 1) {
+                results[route] = cbm_pipeline_pass_definitions(&ctx, &file, 1);
+            } else if (route == 2) {
+                results[route] = cbm_pipeline_pass_calls(&ctx, &file, 1);
+            } else if (route == 3) {
+                results[route] = cbm_pipeline_pass_usages(&ctx, &file, 1);
+            } else {
+                results[route] = cbm_pipeline_pass_semantic(&ctx, &file, 1);
+            }
+        }
+        no_fake_owner_failure =
+            no_fake_owner_failure && !atomic_load(&ctx.test_declarations_failed);
+        fatal_latched = fatal_latched && atomic_load(&ctx.source_oom) && cache[0] == NULL;
+        cbm_free_result(cache[0]);
+        cbm_pipeline_spill_close(&ctx);
+        cbm_registry_free(ctx.registry);
+        cbm_gbuf_free(ctx.gbuf);
+        cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+        cbm_pipeline_set_nsmap(NULL);
+        source_oom_consume_pending_fault();
+    }
+    cbm_pipeline_set_nsmap(saved_nsmap);
+    bool cleanup = !repo[0] || th_rmtree(repo) == 0;
+    printf("  decoded OOM consumers: parallel=%d definitions=%d calls=%d usages=%d semantic=%d\n",
+           results[0], results[1], results[2], results[3], results[4]);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(cleanup);
+    ASSERT_TRUE(no_fake_owner_failure);
+    ASSERT_TRUE(fatal_latched);
+    for (int i = 0; i < 5; i++)
+        ASSERT_EQ(results[i], CBM_PIPELINE_ABORT_PRESERVE_DB);
+    PASS();
+}
+
+TEST(parallel_text_normalization_gate_keeps_pdf_and_code_raw) {
+    const unsigned char raw[] = {0xff, 0xfe, 'x', 0};
+    const CBMLanguage languages[] = {CBM_LANG_MARKDOWN, CBM_LANG_RST, CBM_LANG_ASCIIDOC,
+                                     CBM_LANG_PDF,      CBM_LANG_C,   CBM_LANG_JSON};
+    bool correct = true;
+    for (int i = 0; i < 6; i++) {
+        char *source = malloc(sizeof(raw));
+        if (!source) {
+            correct = false;
+            break;
+        }
+        memcpy(source, raw, sizeof(raw));
+        char *original = source;
+        int length = sizeof(raw);
+        cbm_text_view_t view = {0};
+        cbm_text_view_status_t status =
+            cbm_pipeline_normalize_source(languages[i], &source, &length, &view);
+        correct = correct && status == CBM_TEXT_VIEW_OK &&
+                  (i < 3 ? length == 1 && source[0] == 'x'
+                         : source == original && length == sizeof(raw) &&
+                               memcmp(source, raw, sizeof(raw)) == 0);
+        correct = correct && memcmp(original, raw, sizeof(raw)) == 0;
+        cbm_text_view_release(&view);
+        free(original);
+    }
+    char *broken = malloc(3);
+    if (broken)
+        memcpy(broken, raw, 3);
+    int length = 3;
+    cbm_text_view_t view = {0};
+    cbm_text_view_status_t status =
+        broken ? cbm_pipeline_normalize_source(CBM_LANG_MARKDOWN, &broken, &length, &view)
+               : CBM_TEXT_VIEW_OOM;
+    CBMFileResult *r = cbm_pipeline_text_error_result(CBM_LANG_MARKDOWN, status);
+    bool failure = broken && status == CBM_TEXT_VIEW_INVALID && r && r->has_error && r->error_msg &&
+                   r->doc_links.failed;
+    cbm_text_view_release(&view);
+    free(broken);
+    cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(failure);
+    PASS();
+}
+
+TEST(parallel_document_retention_uses_decoded_text_and_decoded_budget) {
+    const char *dir = th_mktempdir("cbm-document-retention");
+    const char text[] = "# Heading\r\nbody\r\n";
+    unsigned char raw[2 + 2 * (sizeof(text) - 1)];
+    raw[0] = 0xff; raw[1] = 0xfe;
+    for (size_t i = 0; i < sizeof(text) - 1; i++) {
+        raw[2 + 2 * i] = (unsigned char)text[i]; raw[3 + 2 * i] = 0;
+    }
+    const CBMLanguage languages[] = {CBM_LANG_MARKDOWN, CBM_LANG_RST, CBM_LANG_ASCIIDOC};
+    char *names[] = {"doc.md", "doc.rst", "doc.adoc"};
+    char paths[3][1024];
+    cbm_file_info_t files[3] = {0};
+    bool setup = dir != NULL;
+    for (int i = 0; setup && i < 3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", dir, names[i]);
+        FILE *fp = cbm_fopen(paths[i], "wb");
+        setup = fp != NULL;
+        if (fp) {
+            setup = fwrite(raw, 1, sizeof(raw), fp) == sizeof(raw);
+            if (fclose(fp) != 0) setup = false;
+        }
+        files[i] = (cbm_file_info_t){.path = paths[i], .rel_path = names[i],
+                                    .language = languages[i], .size = sizeof(raw)};
+    }
+    atomic_int cancelled; atomic_init(&cancelled, 0);
+    _Atomic int64_t ids; atomic_init(&ids, 1);
+    cbm_pipeline_ctx_t ctx = {.project_name = "documentretention", .repo_path = dir,
+                             .cancelled = &cancelled};
+    ctx.gbuf = setup ? cbm_gbuf_new(ctx.project_name, dir) : NULL;
+    setup = setup && ctx.gbuf;
+    CBMFileResult *cache[3] = {0};
+    cbm_parallel_extract_opts_t opts = {.retain_sources = true, .retain_sources_set = true,
+        .retain_per_file_max_bytes = sizeof(text) - 1, .retain_total_budget_bytes = 3 * (sizeof(text) - 1)};
+    int rc = setup ? cbm_parallel_extract_ex(&ctx, files, 3, cache, &ids, 2, &opts) : -999;
+    bool retained = rc == 0;
+    for (int i = 0; i < 3; i++) {
+        retained = retained && cache[i] && !cache[i]->has_error && cache[i]->source &&
+            cache[i]->source_len == sizeof(text) - 1 &&
+            memcmp(cache[i]->source, text, sizeof(text) - 1) == 0;
+        cbm_free_result(cache[i]);
+    }
+    cbm_pipeline_spill_close(&ctx); cbm_gbuf_free(ctx.gbuf);
+    bool cleanup = !dir || th_rmtree(dir) == 0;
+    ASSERT_TRUE(setup); ASSERT_TRUE(cleanup); ASSERT_EQ(rc, 0); ASSERT_TRUE(retained);
+    PASS();
+}
+
+#endif
 
 TEST(usage_semantic_reference_candidate_trusts_marked_producer) {
     CBMUsage usage = {0};
@@ -6058,6 +6339,13 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
     RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(parallel_decoded_alloc_fault_is_utf16_only_and_one_shot);
+    RUN_TEST(parallel_decoded_oom_cannot_publish_missing_document);
+    RUN_TEST(parallel_decoded_oom_aborts_each_source_consumer);
+    RUN_TEST(parallel_text_normalization_gate_keeps_pdf_and_code_raw);
+    RUN_TEST(parallel_document_retention_uses_decoded_text_and_decoded_budget);
+#endif
     RUN_TEST(sequential_definitions_cache_drops_trees_and_compacts);
     RUN_TEST(sequential_definitions_configured_failure_releases_work_arena);
     RUN_TEST(parallel_empty_files);

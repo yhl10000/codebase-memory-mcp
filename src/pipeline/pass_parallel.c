@@ -1019,7 +1019,8 @@ static int pp_spill_sweep(extract_ctx_t *ec, int worker_id) {
     atomic_fetch_add_explicit(&ec->spill_sweeps_running, 1, memory_order_acq_rel);
     int parked = 0;
     for (int i = 0; i < ec->file_count; i++) {
-        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed) ||
+            atomic_load(&ec->pctx->source_oom)) {
             break;
         }
         uint8_t expected = 1;
@@ -1177,7 +1178,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         cbm_scale_tick(&ec->scale, sort_pos);
         if (atomic_load_explicit(ec->cancelled, memory_order_relaxed) ||
-            atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+            atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed) ||
+            atomic_load(&ec->pctx->source_oom)) {
             break;
         }
 
@@ -1269,7 +1271,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
             }
         }
-        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed) ||
+            atomic_load(&ec->pctx->source_oom)) {
             break;
         }
 
@@ -1330,6 +1333,21 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             continue;
         }
 
+        char *raw_source = source;
+        cbm_text_view_t text = {0};
+        cbm_text_view_status_t text_status =
+            cbm_pipeline_normalize_source(fi->language, &source, &source_len, &text);
+        if (text_status == CBM_TEXT_VIEW_OOM) {
+            atomic_store(&ec->pctx->source_oom, true);
+            cbm_log_error("pipeline.source_oom", "phase", "parallel_extract", "path", fi->rel_path);
+            pp_err_add(errs, fi->rel_path, "text encoding allocation failed", "extract");
+            ws->errors++;
+            cbm_text_view_release(&text);
+            free_source(raw_source);
+            cbm_destroy_thread_parser();
+            break;
+        }
+
         /* Per-file start log: shows which file each worker is processing.
          * Critical for diagnosing stuck workers on large vendored files.
          *
@@ -1350,22 +1368,28 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Export XML uses the same cache slot as every physical file, so its
          * generated classes are composed before entering the common registry
          * and resolution lifecycle. */
-        CBMFileResult *result =
-            cbm_pipeline_test_force_extract_null(ec->pctx, fi->language) ? NULL
-            : fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT
-                ? cbm_pipeline_extract_objectscript_export(source, source_len, ec->project_name,
-                                                           fi->rel_path, ec->macro_table,
-                                                           ec->return_type_table)
-                : cbm_extract_file_ex_with_tests(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL,
-                                                 ec->macro_table, ec->return_type_table,
-                                                 ec->pctx->test_declarations);
+        CBMFileResult *result = NULL;
+        if (text_status != CBM_TEXT_VIEW_OK) {
+            result = cbm_pipeline_text_error_result(fi->language, text_status);
+        } else if (cbm_pipeline_test_force_extract_null(ec->pctx, fi->language)) {
+            result = NULL;
+        } else if (fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+            result = cbm_pipeline_extract_objectscript_export(source, source_len, ec->project_name,
+                                                              fi->rel_path, ec->macro_table,
+                                                              ec->return_type_table);
+        } else {
+            result = cbm_extract_file_ex_with_tests(
+                source, source_len, fi->language, ec->project_name, fi->rel_path,
+                CBM_EXTRACT_BUDGET, NULL, NULL, ec->macro_table, ec->return_type_table,
+                ec->pctx->test_declarations);
+        }
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
         if (!cbm_pipeline_test_extraction_ok(ec->pctx, fi->language, result)) {
             cbm_free_result(result);
-            free_source(source);
+            cbm_text_view_release(&text);
+            free_source(raw_source);
             cbm_destroy_thread_parser();
             cbm_slab_reclaim();
             cbm_mem_collect();
@@ -1373,7 +1397,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         if (!result) {
             log_extract_fail(sort_pos, file_elapsed_ms, fi->rel_path);
-            free_source(source);
+            cbm_text_view_release(&text);
+            free_source(raw_source);
             ws->errors++;
             pp_err_add(errs, fi->rel_path, "extract failed", "extract");
             continue;
@@ -1383,7 +1408,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
         if (!cbm_pipeline_test_result_ok(ec->pctx, result)) {
             cbm_free_result(result);
-            free_source(source);
+            cbm_text_view_release(&text);
+            free_source(raw_source);
             cbm_destroy_thread_parser();
             cbm_slab_reclaim();
             cbm_mem_collect();
@@ -1466,7 +1492,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * is NOT lost to cross-file resolution: resolve_worker re-reads it on
          * demand (bounded, freed immediately). WARN once per run so the
          * operator knows retention was capped (index.retain_capped). */
-        if (ec->retain_sources && source_len > 0) {
+        if (ec->retain_sources && source_len > 0 && text_status == CBM_TEXT_VIEW_OK) {
             bool dropped = false;
             if ((size_t)source_len > ec->retain_per_file_max_bytes) {
                 dropped = true; /* over the per-file cap */
@@ -1501,7 +1527,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         /* Free source buffer — extraction captured everything needed,
          * and the retention copy (if any) lives in result->arena. */
-        free_source(source);
+        cbm_text_view_release(&text);
+        free_source(raw_source);
 
         /* Everything this file will ever contribute has been written; drop
          * the working arena (node-text copies, abandoned array generations)
@@ -1704,9 +1731,12 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_scale_begin(&ec.scale, "parallel_extract", (long)file_count);
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
-    pp_spill_if_projected_over(&ec);
+    if (!atomic_load(&ctx->source_oom)) {
+        pp_spill_if_projected_over(&ec);
+    }
     if (pp_spill_active(&ec) &&
-        !atomic_load_explicit(&ec.over_budget_abort, memory_order_relaxed)) {
+        !atomic_load_explicit(&ec.over_budget_abort, memory_order_relaxed) &&
+        !atomic_load(&ctx->source_oom)) {
         /* Spill mode was entered, so results belong on disk: park every
          * result still cached before the phases that cannot park (registry
          * build, resolve, the semantic pass) inherit them. The sweeps above
@@ -1774,6 +1804,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     /* The over-budget verdict outranks the cancel sentinel: a caller must be
      * able to name the cause, and the orchestrator discards the staging DB on
      * every non-zero code alike (the live generation is never touched). */
+    if (atomic_load(&ctx->source_oom)) {
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     if (atomic_load(&ctx->test_declarations_failed)) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_extract");
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
@@ -4381,7 +4414,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             break;
         }
         cbm_scale_tick(&rc->scale, file_idx);
-        if (atomic_load_explicit(rc->cancelled, memory_order_relaxed)) {
+        if (atomic_load_explicit(rc->cancelled, memory_order_relaxed) ||
+            (rc->pctx && atomic_load(&rc->pctx->source_oom))) {
             break;
         }
 
@@ -4521,13 +4555,38 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * walks across thousands of files in a single worker thread. */
         if (cross_lsp_eligible) {
             char *lsp_source_owned = NULL;
+            cbm_text_view_t lsp_text = {0};
             const char *lsp_source = result->source;
             int lsp_source_len = result->source_len;
             if ((!lsp_source || lsp_source_len <= 0) && rc->files[file_idx].path) {
                 /* Retention cap skipped this file — re-read on demand (bounded
                  * by read_file's cbm_max_file_bytes cap), freed below. */
                 lsp_source_owned = read_file(rc->files[file_idx].path, &lsp_source_len, NULL, NULL);
-                lsp_source = lsp_source_owned;
+                char *decoded_source = lsp_source_owned;
+                if (lsp_source_owned) {
+                    cbm_text_view_status_t text_status = cbm_pipeline_normalize_source(
+                        lang, &decoded_source, &lsp_source_len, &lsp_text);
+                    if (text_status == CBM_TEXT_VIEW_OOM) {
+                        atomic_store(&rc->pctx->source_oom, true);
+                        cbm_log_error("pipeline.source_oom", "phase", "resolve_reread", "path",
+                                      rel);
+                        ws->errors++;
+                        cbm_text_view_release(&lsp_text);
+                        free_source(lsp_source_owned);
+                        goto resolve_file_cleanup;
+                    }
+                    if (text_status != CBM_TEXT_VIEW_OK) {
+                        result->has_error = true;
+                        result->error_msg = "invalid text encoding";
+                        result->doc_links.failed = true;
+                        cbm_text_view_release(&lsp_text);
+                        free_source(lsp_source_owned);
+                        lsp_source_owned = NULL;
+                        decoded_source = NULL;
+                        lsp_source_len = 0;
+                    }
+                }
+                lsp_source = decoded_source;
             }
             if (lsp_source && lsp_source_len > 0) {
                 const char *def_module = rc->def_modules ? rc->def_modules[file_idx] : module_qn;
@@ -4574,6 +4633,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     ws->errors++;
                 }
                 /* Free the on-demand re-read (no-op when source was retained). */
+                cbm_text_view_release(&lsp_text);
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
                  * destroyed first; otherwise its lexer holds slab pointers
@@ -4603,6 +4663,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * doing so would flood skipped[] with false positives (itself a
                  * false-guard bug). The "cross_lsp" phase string is reserved for
                  * Track C's real crash-attribution signal; leave it unwired. */
+                cbm_text_view_release(&lsp_text);
                 free_source(lsp_source_owned);
                 if (result->has_test_definition_owners) {
                     cbm_pipeline_test_owner_error(result);
@@ -4827,6 +4888,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_aligned_free(workers);
 
+    if (atomic_load(&ctx->source_oom)) {
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     if (atomic_load(&ctx->test_declarations_failed)) {
         cbm_log_error("pipeline.err", "phase", "test_declarations_resolve");
         return CBM_PIPELINE_ABORT_PRESERVE_DB;

@@ -68,6 +68,7 @@ enum {
 #include "cypher/cypher.h"
 #include "discover/discover.h"
 #include "pipeline/pipeline.h"
+#include "cbm.h"
 #include "callable_sig.h"       /* cbm_qn_callable_base_len */
 #include "pipeline/doc_links.h" /* cbm_doclink_reason_name: the reasons the layer writes */
 #include "pipeline/pass_cross_repo.h"
@@ -7159,9 +7160,23 @@ static bool mcp_recorded_sha256(const char *sha) {
     return true;
 }
 
+static bool mcp_is_text_document(const char *path) {
+    CBMLanguage lang = cbm_language_for_filename(cbm_path_base(path));
+    return lang == CBM_LANG_MARKDOWN || lang == CBM_LANG_RST || lang == CBM_LANG_ASCIIDOC;
+}
+
+enum { MCP_UTF16_BOM_FF = 0xff, MCP_UTF16_BOM_FE = 0xfe };
+
+static bool mcp_has_utf16_bom(const char *bytes, size_t length) {
+    return length >= PAIR_LEN && (((unsigned char)bytes[0] == MCP_UTF16_BOM_FF &&
+                                   (unsigned char)bytes[SKIP_ONE] == MCP_UTF16_BOM_FE) ||
+                                  ((unsigned char)bytes[0] == MCP_UTF16_BOM_FE &&
+                                   (unsigned char)bytes[SKIP_ONE] == MCP_UTF16_BOM_FF));
+}
+
 /* #2585: read a whole file into *bytes (released with cbm_sb_free), so that
  * the bytes a response serves are the bytes whose hash was checked. */
-static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes) {
+static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes, size_t limit) {
     cbm_sb_init(bytes);
     FILE *file = cbm_fopen(abs_path, "rb");
     if (!file) {
@@ -7169,10 +7184,25 @@ static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes) {
     }
     char buf[CBM_SZ_4K];
     size_t len;
+    bool oversized = false;
     while ((len = fread(buf, 1, sizeof(buf), file)) > 0) {
+        if (bytes->len == 0 && mcp_has_utf16_bom(buf, len) && mcp_is_text_document(abs_path)) {
+            size_t document_limit = (size_t)cbm_max_file_bytes();
+            if (document_limit > INT_MAX) {
+                document_limit = INT_MAX;
+            }
+            if (limit > document_limit) {
+                limit = document_limit;
+            }
+        }
+        if (len > limit - bytes->len) {
+            oversized = true;
+            cbm_log_warn("mcp.source.decode_failed", "path", abs_path, "reason", "oversized");
+            break;
+        }
         cbm_sb_append_n(bytes, buf, len);
     }
-    bool valid = !ferror(file) && !bytes->oom;
+    bool valid = !oversized && !ferror(file) && !bytes->oom;
     if (fclose(file) != 0) {
         valid = false;
     }
@@ -7220,6 +7250,34 @@ static char *mcp_slice_lines(cbm_sb_t *bytes, int start, int end) {
     }
 #endif
     return slice;
+}
+
+static char *mcp_slice_source_lines(const char *path, cbm_sb_t *bytes, int start, int end) {
+    if (!mcp_has_utf16_bom(bytes->buf, bytes->len) || !mcp_is_text_document(path)) {
+        return mcp_slice_lines(bytes, start, end);
+    }
+    size_t limit = (size_t)cbm_max_file_bytes();
+    if (bytes->len > limit || bytes->len > INT_MAX) {
+        cbm_log_warn("mcp.source.decode_failed", "path", path, "reason", "oversized");
+        return NULL;
+    }
+    cbm_text_view_t text;
+    cbm_text_view_status_t status = cbm_text_view_init(bytes->buf, bytes->len, &text);
+    char *lines = NULL;
+    if (status == CBM_TEXT_VIEW_OK && text.length <= limit) {
+        cbm_sb_t decoded = {.buf = text.owned, .len = text.length};
+        lines = mcp_slice_lines(&decoded, start, end);
+    } else {
+        const char *reason = "oversized";
+        if (status == CBM_TEXT_VIEW_OOM) {
+            reason = "allocation_failed";
+        } else if (status == CBM_TEXT_VIEW_INVALID) {
+            reason = "invalid_encoding";
+        }
+        cbm_log_warn("mcp.source.decode_failed", "path", path, "reason", reason);
+    }
+    cbm_text_view_release(&text);
+    return lines;
 }
 
 /* A path is current when its bytes were verified to be the indexed bytes,
@@ -7286,7 +7344,7 @@ static const char *coverage_path_freshness_capture(cbm_store_t *store, const cha
     char current[CBM_SHA256_HEX_LEN + 1] = "";
     bool hashed = false;
     if (captured) {
-        *captured_ok = mcp_read_file_bytes(abs_path, captured);
+        *captured_ok = mcp_read_file_bytes(abs_path, captured, SIZE_MAX);
         if (*captured_ok) {
             cbm_sha256_hex(captured->buf ? captured->buf : "", captured->len, current);
             hashed = true;
@@ -11314,10 +11372,45 @@ static void free_node_contents(cbm_node_t *n) {
 
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
+static bool mcp_probe_text_encoding(const char *path, FILE *file, bool *utf16) {
+    *utf16 = false;
+    if (!mcp_is_text_document(path)) {
+        return true;
+    }
+    char bom[PAIR_LEN];
+    size_t length = fread(bom, SKIP_ONE, sizeof(bom), file);
+    *utf16 = mcp_has_utf16_bom(bom, length);
+    return !ferror(file) && (*utf16 || fseek(file, 0, SEEK_SET) == 0);
+}
+
+static char *mcp_read_utf16_lines(const char *path, int start, int end) {
+    cbm_sb_t bytes;
+    size_t limit = (size_t)cbm_max_file_bytes();
+    if (limit > INT_MAX) {
+        limit = INT_MAX;
+    }
+    /* The file may change encoding after the BOM probe; keep the reread bounded. */
+    if (!mcp_read_file_bytes(path, &bytes, limit)) {
+        return NULL;
+    }
+    char *lines = mcp_slice_source_lines(path, &bytes, start, end);
+    cbm_sb_free(&bytes);
+    return lines;
+}
+
 static char *read_file_lines(const char *path, int start, int end) {
     FILE *fp = cbm_fopen(path, "r");
     if (!fp) {
         return NULL;
+    }
+    bool utf16 = false;
+    if (!mcp_probe_text_encoding(path, fp, &utf16)) {
+        (void)fclose(fp);
+        return NULL;
+    }
+    if (utf16) {
+        (void)fclose(fp);
+        return mcp_read_utf16_lines(path, start, end);
     }
 
     /* Whole line spans per memchr instead of one locked fgetc and one append
@@ -14000,7 +14093,7 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
 
     *out_abs_path = abs_path;
     if (cbm_path_within_root(root_path, abs_path)) {
-        return captured ? mcp_slice_lines(captured, start, end)
+        return captured ? mcp_slice_source_lines(file_path, captured, start, end)
                         : read_file_lines(abs_path, start, end);
     }
     return NULL;

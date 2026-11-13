@@ -3634,14 +3634,12 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
 }
 #endif
 
-static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
-                                           const char *project, const char *rel_path,
-                                           int64_t timeout_micros, const char **extra_defines,
-                                           const char **include_paths,
-                                           const CBMMacroTable *macro_table,
-                                           const CBMReturnTypeTable *return_type_table,
-                                           CBMArena *scratch,
-                                           const cbm_test_declarations_t *test_declarations) {
+static CBMFileResult *extract_file_ex_body(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table, CBMArena *scratch,
+    const cbm_test_declarations_t *test_declarations, cbm_text_view_status_t text_status) {
     // Allocate result on heap (arena inside for all string data)
     CBMFileResult *result = cbm_result_alloc();
     if (!result) {
@@ -3670,6 +3668,15 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     cbm_index_mark_start(rel_path);
+    if (text_status != CBM_TEXT_VIEW_OK) {
+        result->has_error = true;
+        result->error_msg =
+            cbm_arena_strdup(a, text_status == CBM_TEXT_VIEW_OOM ? "text encoding allocation failed"
+                                                                 : "invalid text encoding");
+        result->doc_links.failed = true;
+        cbm_index_mark_done(rel_path);
+        return result;
+    }
 #ifdef CBM_ENABLE_TEST_SEAMS
     cbm_test_fault_inject(rel_path);
 #endif
@@ -4710,6 +4717,18 @@ CBMFileResult *cbm_extract_file_ex_with_tests(
     const char *rel_path, int64_t timeout_micros, const char **extra_defines,
     const char **include_paths, const CBMMacroTable *macro_table,
     const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations) {
+    cbm_text_view_t text = {0};
+    cbm_text_view_status_t text_status = CBM_TEXT_VIEW_OK;
+    /* Code byte coordinates and binary importers retain their existing raw-source contracts. */
+    if (language == CBM_LANG_MARKDOWN || language == CBM_LANG_RST ||
+        language == CBM_LANG_ASCIIDOC) {
+        text_status = source_len < 0 ? CBM_TEXT_VIEW_INVALID
+                                     : cbm_text_view_init(source, (size_t)source_len, &text);
+        if (text_status == CBM_TEXT_VIEW_OK) {
+            source = text.data;
+            source_len = (int)text.length;
+        }
+    }
     CBMArena scratch;
     if (tl_scratch_live && tl_scratch_slot) {
         scratch = *tl_scratch_slot;
@@ -4720,7 +4739,7 @@ CBMFileResult *cbm_extract_file_ex_with_tests(
     }
     CBMFileResult *result = extract_file_ex_body(
         source, source_len, language, project, rel_path, timeout_micros, extra_defines,
-        include_paths, macro_table, return_type_table, &scratch, test_declarations);
+        include_paths, macro_table, return_type_table, &scratch, test_declarations, text_status);
     /* Even early parse/quarantine exits publish conservative Python metadata.
      * No tree is reparsed, and existing best-effort extraction flags stay intact. */
     if (result && language == CBM_LANG_PYTHON &&
@@ -4771,6 +4790,7 @@ CBMFileResult *cbm_extract_file_ex_with_tests(
         cbm_arena_destroy(&scratch);
     }
     cbm_test_declarations_degrade(result);
+    cbm_text_view_release(&text);
     return result;
 }
 

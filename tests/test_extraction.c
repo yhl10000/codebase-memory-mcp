@@ -20,6 +20,9 @@
 #include "iris_export_xml.h"
 #include "helpers.h"    /* cbm_count_branching (walker stack cap) */
 #include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
+#include "foundation/str_util.h"
+#include "foundation/mem_core.h"
+#include <limits.h>
 
 /* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
 #include "pipeline/worker_pool.h"            /* CBM_WORKER_STACK_SIZE */
@@ -29,6 +32,179 @@
 #endif
 
 /* ── Helpers ───────────────────────────────────────────────────── */
+
+TEST(text_view_decodes_bom_and_preserves_bytes) {
+    const char utf8[] = "# A\r\n\xc3\xa9\xe4\xb8\xad\xf0\x9f\x98\x80\r\n";
+    const unsigned char le[] = {0xff, 0xfe, '#', 0, ' ', 0, 'A', 0, 13, 0, 10, 0,
+                                0xe9, 0, 0x2d, 0x4e, 0x3d, 0xd8, 0, 0xde, 13, 0, 10, 0};
+    cbm_text_view_t view;
+    for (int be = 0; be < 2; be++) {
+        char raw[sizeof(le)];
+        for (size_t i = 0; i < sizeof(le); i += 2) {
+            raw[i] = (char)le[i + be];
+            raw[i + 1] = (char)le[i + !be];
+        }
+        ASSERT_EQ(cbm_text_view_init(raw, sizeof(raw), &view), CBM_TEXT_VIEW_OK);
+        ASSERT_NOT_NULL(view.owned);
+        ASSERT_EQ(view.encoding, be ? CBM_TEXT_UTF16_BE : CBM_TEXT_UTF16_LE);
+        ASSERT_EQ(view.length, sizeof(utf8) - 1);
+        ASSERT_STR_EQ(view.data, utf8);
+        cbm_text_view_release(&view);
+        ASSERT_NULL(view.owned);
+        ASSERT_NULL(view.data);
+        cbm_text_view_release(&view);
+        ASSERT_EQ(cbm_text_view_init(raw, 2, &view), CBM_TEXT_VIEW_OK);
+        ASSERT_NOT_NULL(view.owned);
+        ASSERT_EQ(view.length, 0);
+        ASSERT_STR_EQ(view.data, "");
+        cbm_text_view_release(&view);
+    }
+    const char bom[] = "\xef\xbb\xbf# A\r\n";
+    const char unguessed[] = {(char)0x80, 0};
+    const char *borrowed[] = {utf8, bom, "", unguessed};
+    for (size_t i = 0; i < sizeof(borrowed) / sizeof(borrowed[0]); i++) {
+        size_t n = strlen(borrowed[i]);
+        ASSERT_EQ(cbm_text_view_init(borrowed[i], n, &view), CBM_TEXT_VIEW_OK);
+        ASSERT_TRUE(view.data == borrowed[i]);
+        ASSERT_NULL(view.owned);
+        ASSERT_EQ(view.length, n);
+        ASSERT_EQ(view.encoding, CBM_TEXT_UTF8);
+        cbm_text_view_release(&view);
+    }
+    PASS();
+}
+
+TEST(text_view_decoded_allocation_is_accounted) {
+    const char raw[] = {(char)0xff, (char)0xfe, 'x', 0};
+    size_t before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_EXTRACT);
+    cbm_text_view_t view = {0};
+    ASSERT_EQ(cbm_text_view_init(raw, sizeof(raw), &view), CBM_TEXT_VIEW_OK);
+    bool accounted = cbm_mem_class_live_blocks(CBM_MEM_CLASS_EXTRACT) == before + 1;
+    cbm_text_view_release(&view);
+    ASSERT_TRUE(accounted);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_EXTRACT), before);
+    PASS();
+}
+
+TEST(text_view_rejects_invalid_units_and_lengths) {
+    const unsigned char invalid[][6] = {{0xff, 0xfe, 0},
+                                        {0xff, 0xfe, 0, 0xd8},
+                                        {0xff, 0xfe, 0, 0xdc},
+                                        {0xff, 0xfe, 0, 0xd8, 'A', 0},
+                                        {0xfe, 0xff, 0xd8, 0},
+                                        {0xfe, 0xff, 0xdc, 0},
+                                        {0xfe, 0xff, 0xd8, 0, 0, 'A'},
+                                        {0xff, 0xfe, 0, 0},
+                                        {'A', 0, 'B'}};
+    const size_t lengths[] = {3, 4, 4, 6, 4, 4, 6, 4, 3};
+    cbm_text_view_t view;
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        ASSERT_EQ(cbm_text_view_init((const char *)invalid[i], lengths[i], &view),
+                  CBM_TEXT_VIEW_INVALID);
+        ASSERT_NULL(view.owned);
+        cbm_text_view_release(&view);
+    }
+    ASSERT_EQ(cbm_text_view_init("x", (size_t)INT_MAX + 1, &view), CBM_TEXT_VIEW_INVALID);
+    ASSERT_EQ(cbm_text_view_init("x", SIZE_MAX, &view), CBM_TEXT_VIEW_INVALID);
+    ASSERT_EQ(cbm_text_view_init(NULL, 1, &view), CBM_TEXT_VIEW_INVALID);
+    ASSERT_EQ(cbm_text_view_init("x", 1, NULL), CBM_TEXT_VIEW_INVALID);
+    PASS();
+}
+
+TEST(extract_invalid_text_is_diagnosed) {
+    const char raw[][4] = {{(char)0xff, (char)0xfe, 0, (char)0xd8},
+                           {(char)0xff, (char)0xfe, 'A'}, {'A', 0, 'B'}};
+    const int lengths[] = {4, 3, 3};
+    const CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_RST, CBM_LANG_ASCIIDOC};
+    for (size_t i = 0; i < sizeof(langs) / sizeof(langs[0]); i++) {
+        for (size_t j = 0; j < sizeof(lengths) / sizeof(lengths[0]); j++) {
+            CBMFileResult *r = cbm_extract_file(raw[j], lengths[j], langs[i], "p", "bad.md",
+                                                0, NULL, NULL);
+            ASSERT_NOT_NULL(r);
+            ASSERT_TRUE(r->has_error);
+            ASSERT_TRUE(r->doc_links.failed);
+            ASSERT_NOT_NULL(r->error_msg);
+            ASSERT_NOT_NULL(strstr(r->error_msg, "encoding"));
+            cbm_free_result(r);
+        }
+    }
+    PASS();
+}
+
+TEST(extract_utf16_text_matches_utf8) {
+    const char *sources[] = {"Guide\r\n=====\r\n\r\nUse ``app/run.py``.\r\n",
+                             "= Guide\r\n\r\nUse `app/run.py`.\r\n"};
+    const CBMLanguage langs[] = {CBM_LANG_RST, CBM_LANG_ASCIIDOC};
+    const char *paths[] = {"guide.rst", "guide.adoc"};
+    for (size_t s = 0; s < sizeof(langs) / sizeof(langs[0]); s++) {
+        size_t n = strlen(sources[s]);
+        CBMFileResult *control = cbm_extract_file(sources[s], (int)n, langs[s], "p", paths[s],
+                                                  0, NULL, NULL);
+        ASSERT_NOT_NULL(control);
+        ASSERT_FALSE(control->has_error);
+        ASSERT_GT(control->defs.count, 0);
+        for (int be = 0; be < 2; be++) {
+            char raw[256];
+            ASSERT_TRUE(2 + 2 * n <= sizeof(raw));
+            raw[0] = be ? (char)0xfe : (char)0xff;
+            raw[1] = be ? (char)0xff : (char)0xfe;
+            for (size_t i = 0; i < n; i++) {
+                raw[2 + 2 * i + be] = sources[s][i];
+                raw[2 + 2 * i + !be] = 0;
+            }
+            CBMFileResult *r = cbm_extract_file(raw, (int)(2 + 2 * n), langs[s], "p", paths[s],
+                                                0, NULL, NULL);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->has_error);
+            ASSERT_EQ(r->defs.count, control->defs.count);
+            ASSERT_EQ(r->doc_links.count, control->doc_links.count);
+            for (int i = 0; i < r->defs.count; i++) {
+                ASSERT_STR_EQ(r->defs.items[i].name, control->defs.items[i].name);
+                ASSERT_EQ(r->defs.items[i].start_line, control->defs.items[i].start_line);
+                ASSERT_EQ(r->defs.items[i].end_line, control->defs.items[i].end_line);
+            }
+            for (int i = 0; i < r->doc_links.count; i++) {
+                ASSERT_STR_EQ(r->doc_links.items[i].raw, control->doc_links.items[i].raw);
+                ASSERT_STR_EQ(r->doc_links.items[i].source_qn, control->doc_links.items[i].source_qn);
+                ASSERT_EQ(r->doc_links.items[i].line, control->doc_links.items[i].line);
+            }
+            cbm_free_result(r);
+        }
+        cbm_free_result(control);
+    }
+    PASS();
+}
+
+TEST(extract_code_keeps_raw_encoding_contract) {
+    const char raw[] = {(char)0xff, (char)0xfe, 0, (char)0xd8};
+    CBMFileResult *r = cbm_extract_file(raw, sizeof(raw), CBM_LANG_PYTHON, "p", "raw.py",
+                                        0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(!r->error_msg || !strstr(r->error_msg, "encoding"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_bom_only_documents_match_empty_utf8) {
+    const CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_RST, CBM_LANG_ASCIIDOC};
+    for (size_t i = 0; i < sizeof(langs) / sizeof(langs[0]); i++) {
+        CBMFileResult *control = cbm_extract_file("", 0, langs[i], "p", "empty.md", 0, NULL, NULL);
+        ASSERT_NOT_NULL(control);
+        for (int be = 0; be < 2; be++) {
+            const char raw[] = {be ? (char)0xfe : (char)0xff, be ? (char)0xff : (char)0xfe};
+            CBMFileResult *r = cbm_extract_file(raw, sizeof(raw), langs[i], "p", "empty.md",
+                                                0, NULL, NULL);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->has_error);
+            ASSERT_FALSE(r->doc_links.failed);
+            ASSERT_EQ(r->defs.count, control->defs.count);
+            ASSERT_EQ(r->doc_links.count, control->doc_links.count);
+            cbm_free_result(r);
+        }
+        cbm_free_result(control);
+    }
+    PASS();
+}
 
 /* Check if any definition with the given label has the given name. */
 static int has_def(CBMFileResult *r, const char *label, const char *name) {
@@ -15268,6 +15444,13 @@ TEST(extraction_marker_round_trips_non_ascii_environment_path) {
 #endif
 
 SUITE(extraction) {
+    RUN_TEST(text_view_decodes_bom_and_preserves_bytes);
+    RUN_TEST(text_view_decoded_allocation_is_accounted);
+    RUN_TEST(text_view_rejects_invalid_units_and_lengths);
+    RUN_TEST(extract_invalid_text_is_diagnosed);
+    RUN_TEST(extract_utf16_text_matches_utf8);
+    RUN_TEST(extract_code_keeps_raw_encoding_contract);
+    RUN_TEST(extract_bom_only_documents_match_empty_utf8);
 #ifdef _WIN32
     RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
 #endif

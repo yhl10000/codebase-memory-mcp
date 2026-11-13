@@ -2759,7 +2759,8 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
      * impossible. */
     enum { PREDUMP_PASS_COUNT = (int)(sizeof(passes) / sizeof(passes[0])) };
     struct timespec t;
-    for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
+    for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p) && !atomic_load(&ctx->source_oom);
+         i++) {
         if (!predump_pass_runs(p, passes[i].gate)) {
             continue;
         }
@@ -4309,6 +4310,9 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
+    if (atomic_load(&ctx->source_oom)) {
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_cancel_after_predump()) {
@@ -4373,7 +4377,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int rc = run_structure_and_extraction(p, ctx, files, file_count);
     ctx->stem_marks = NULL;
     cbm_stem_marks_free(&marks);
-    return rc;
+    return atomic_load(&ctx->source_oom) ? CBM_PIPELINE_ABORT_PRESERVE_DB : rc;
 }
 
 static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {

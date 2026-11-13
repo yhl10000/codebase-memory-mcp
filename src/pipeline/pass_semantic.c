@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
  * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
@@ -694,13 +695,27 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
         }
         return NULL;
     }
-    CBMFileResult *r =
-        cbm_pipeline_test_force_extract_null(ctx, fi->language)
-            ? NULL
-            : cbm_extract_file_ex_with_tests(source, source_len, fi->language, ctx->project_name,
-                                             fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, NULL,
-                                             NULL, ctx->test_declarations);
-    cbm_free(CBM_MEM_CLASS_SEMANTIC, source);
+    char *raw_source = source;
+    cbm_text_view_t text = {0};
+    cbm_text_view_status_t text_status =
+        cbm_pipeline_normalize_source(fi->language, &source, &source_len, &text);
+    if (text_status == CBM_TEXT_VIEW_OOM) {
+        atomic_store(&ctx->source_oom, true);
+        cbm_log_error("pipeline.source_oom", "phase", "semantic_fallback", "path", fi->rel_path);
+    }
+    CBMFileResult *r = NULL;
+    if (text_status != CBM_TEXT_VIEW_OK) {
+        r = cbm_pipeline_text_error_result(fi->language, text_status);
+    } else if (!cbm_pipeline_test_force_extract_null(ctx, fi->language)) {
+        r = cbm_extract_file_ex_with_tests(source, source_len, fi->language, ctx->project_name,
+                                           fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL,
+                                           ctx->test_declarations);
+    }
+    cbm_text_view_release(&text);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, raw_source);
+    if (text_status == CBM_TEXT_VIEW_OOM) {
+        return NULL;
+    }
     (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, r);
     if (r) {
         *owned = true;
@@ -757,7 +772,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         bool result_owned = false;
         CBMFileResult *result = sem_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
-            if (atomic_load(&ctx->test_declarations_failed)) {
+            if (atomic_load(&ctx->source_oom) || atomic_load(&ctx->test_declarations_failed)) {
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
             errors++;

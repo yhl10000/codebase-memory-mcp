@@ -41,6 +41,9 @@ static bool gf_absolute(const char *path) {
 }
 
 static bool gf_write(const char *path, const void *bytes, size_t length) {
+    /* Git for Windows hides .git files, which the CRT cannot truncate in place. */
+    if (cbm_file_exists(path) && th_unlink_force(path) != 0)
+        return false;
     FILE *file = cbm_fopen(path, "wb");
     if (!file)
         return false;

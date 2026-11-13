@@ -28,9 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
-#include <stdatomic.h>
 
 static _Atomic uint64_t g_lsp_reference_lookup_rows_examined = 0;
 
@@ -475,12 +475,26 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_pipeline_test_force_extract_null(ctx, files[i].language)
-                         ? NULL
-                         : cbm_extract_file_ex_with_tests(
-                               source, source_len, files[i].language, ctx->project_name, rel,
-                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations);
-            free(source);
+            char *raw_source = source;
+            cbm_text_view_t text = {0};
+            cbm_text_view_status_t text_status =
+                cbm_pipeline_normalize_source(files[i].language, &source, &source_len, &text);
+            if (text_status == CBM_TEXT_VIEW_OOM) {
+                atomic_store(&ctx->source_oom, true);
+                cbm_log_error("pipeline.source_oom", "phase", "usages_fallback", "path", rel);
+            }
+            if (text_status != CBM_TEXT_VIEW_OK) {
+                result = cbm_pipeline_text_error_result(files[i].language, text_status);
+            } else if (!cbm_pipeline_test_force_extract_null(ctx, files[i].language)) {
+                result = cbm_extract_file_ex_with_tests(
+                    source, source_len, files[i].language, ctx->project_name, rel,
+                    CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations);
+            }
+            cbm_text_view_release(&text);
+            free(raw_source);
+            if (text_status == CBM_TEXT_VIEW_OOM) {
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            }
             if (!cbm_pipeline_test_extraction_ok(ctx, files[i].language, result)) {
                 cbm_free_result(result);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;

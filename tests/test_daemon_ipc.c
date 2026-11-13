@@ -1056,39 +1056,35 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     PASS();
 }
 
-/* Derive THIS machine's account-domain SID (S-1-5-21-a-b-c) from the current
- * process token (S-1-5-21-a-b-c-<rid>), independently of production's LSA-based
- * resolution. Caller frees with FreeSid. */
+/* A domain/cloud login's token does not identify this machine's SAM domain.
+ * Resolve it
+ * independently of production's LSA path. Caller frees with FreeSid. */
 static PSID ipc_test_local_account_domain_sid(void) {
-    HANDLE token = NULL;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    WCHAR computer[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD computer_chars = (DWORD)(sizeof(computer) / sizeof(computer[0]));
+    if (!GetComputerNameW(computer, &computer_chars)) {
         return NULL;
     }
-    DWORD needed = 0;
-    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
-    PSID domain = NULL;
-    if (needed > 0) {
-        void *buffer = calloc(1, needed);
-        if (buffer && GetTokenInformation(token, TokenUser, buffer, needed, &needed)) {
-            PSID user = ((TOKEN_USER *)buffer)->User.Sid;
-            if (user && IsValidSid(user)) {
-                UCHAR count = *GetSidSubAuthorityCount(user);
-                SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(user);
-                /* Machine/domain account SID: NT authority (Value[5]==5), first
-                 * sub-authority 21, at least the three domain sub-authorities plus
-                 * the account RID. Drop the RID to recover the domain SID. */
-                if (count >= 4 && authority->Value[5] == 5 && *GetSidSubAuthority(user, 0) == 21U) {
-                    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
-                    (void)AllocateAndInitializeSid(
-                        &nt, 4, *GetSidSubAuthority(user, 0), *GetSidSubAuthority(user, 1),
-                        *GetSidSubAuthority(user, 2), *GetSidSubAuthority(user, 3), 0, 0, 0, 0,
-                        &domain);
-                }
-            }
-        }
-        free(buffer);
+    _Alignas(SID) BYTE buffer[SECURITY_MAX_SID_SIZE];
+    DWORD needed = sizeof(buffer);
+    WCHAR referenced_domain[MAX_PATH];
+    DWORD referenced_chars = (DWORD)(sizeof(referenced_domain) / sizeof(referenced_domain[0]));
+    SID_NAME_USE use = SidTypeUnknown;
+    if (!LookupAccountNameW(NULL, computer, buffer, &needed, referenced_domain, &referenced_chars,
+                            &use) ||
+        use != SidTypeDomain || !IsValidSid(buffer)) {
+        return NULL;
     }
-    (void)CloseHandle(token);
+    UCHAR count = *GetSidSubAuthorityCount(buffer);
+    SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(buffer);
+    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+    PSID domain = NULL;
+    if (count == 4 && memcmp(authority, &nt, sizeof(nt)) == 0 &&
+        *GetSidSubAuthority(buffer, 0) == 21U) {
+        (void)AllocateAndInitializeSid(
+            &nt, 4, *GetSidSubAuthority(buffer, 0), *GetSidSubAuthority(buffer, 1),
+            *GetSidSubAuthority(buffer, 2), *GetSidSubAuthority(buffer, 3), 0, 0, 0, 0, &domain);
+    }
     return domain;
 }
 
